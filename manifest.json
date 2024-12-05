@@ -1,0 +1,24 @@
+{
+    "manifest_version": 3,
+    "name": "Screenshot Task Manager",
+    "version": "1.0",
+    "description": "Manage screenshot tasks and send them to specified endpoints",
+    "permissions": [
+      "activeTab",
+      "storage",
+      "scripting",
+      "tabs"
+    ],
+    "action": {
+      "default_title": "Screenshot Task Manager"
+    },
+    "background": {
+      "service_worker": "background.js"
+    },
+    "content_scripts": [
+      {
+        "matches": ["<all_urls>"],
+        "js": ["html2canvas.min.js", "content.js"]
+      }
+    ]
+  }
