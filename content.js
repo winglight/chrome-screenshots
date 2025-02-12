@@ -6,6 +6,15 @@ function initializeTaskManager() {
   const form = document.getElementById('task-form');
   const cancelBtn = document.querySelector('.cancel-btn');
   
+  const closeBtn = document.getElementById('close-sidebar-btn');
+  const sidebar = document.getElementById('screenshot-task-sidebar');
+  closeBtn.addEventListener('click', () => {
+    // stopAllTasks();
+    sidebar.style.display = 'none';
+    // Set state in storage
+    chrome.storage.local.set({ sidebarVisible: false });
+  });
+
   // Load existing tasks
   chrome.storage.local.get(['tasks'], function(result) {
     tasks = result.tasks || {};
@@ -40,6 +49,11 @@ function initializeTaskManager() {
       apiToken: formData.get('apiToken'),
       active: false
     };
+
+    if (form.dataset.editTaskId && tasks[form.dataset.editTaskId]?.active) {
+      taskData.active = true;
+      taskData.intervalId = tasks[form.dataset.editTaskId].intervalId;
+    }
 
     tasks[taskData.id] = taskData;
     chrome.storage.local.set({ tasks });
@@ -158,65 +172,51 @@ function deleteTask(taskId) {
   renderTasks();
 }
 
-// 修改表单提交处理
-function initializeTaskManager() {
-  const addTaskBtn = document.getElementById('add-task-btn');
-  const modal = document.getElementById('task-modal');
-  const form = document.getElementById('task-form');
-  const cancelBtn = document.querySelector('.cancel-btn');
-  
-  // 加载现有任务
-  chrome.storage.local.get(['tasks'], function(result) {
-    tasks = result.tasks || {};
-    renderTasks();
-  });
-
-  addTaskBtn.addEventListener('click', () => {
-    form.reset();
-    delete form.dataset.editTaskId; // 清除编辑状态
-    modal.style.display = 'flex';
-  });
-
-  modal.addEventListener('click', (e) => {
-    if (e.target === modal) {
-      modal.style.display = 'none';
+function stopAllTasks() {
+  Object.values(tasks).forEach(task => {
+    if (task.active) {
+      clearInterval(task.intervalId);
+      task.active = false;
     }
   });
+  chrome.storage.local.set({ tasks });
+}
 
-  cancelBtn.addEventListener('click', () => {
-    modal.style.display = 'none';
-  });
 
-  form.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const formData = new FormData(form);
-    const taskData = {
-      id: form.dataset.editTaskId || Date.now(),
-      screenshotArea: formData.get('screenshotArea'),
-      selector: formData.get('selector'),
-      interval: parseInt(formData.get('interval')),
-      apiUrl: formData.get('apiUrl'),
-      apiToken: formData.get('apiToken'),
-      active: false
-    };
 
-    if (form.dataset.editTaskId && tasks[form.dataset.editTaskId]?.active) {
-      taskData.active = true;
-      taskData.intervalId = tasks[form.dataset.editTaskId].intervalId;
-    }
-
-    tasks[taskData.id] = taskData;
-    chrome.storage.local.set({ tasks });
-    modal.style.display = 'none';
-    renderTasks();
-  });
-
-  // 处理截图区域选择器变化
-  const screenshotAreaSelect = form.querySelector('[name="screenshotArea"]');
-  const selectorInput = form.querySelector('[name="selector"]');
+async function captureElement(element) {
+  // Get device pixel ratio for scaling
+  const pixelRatio = window.devicePixelRatio;
   
-  screenshotAreaSelect.addEventListener('change', (e) => {
-    selectorInput.style.display = e.target.value === 'selector' ? 'block' : 'none';
+  // Get scroll position
+  const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
+  const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+  
+  // Get element dimensions
+  const rect = element.getBoundingClientRect();
+  
+  // Calculate actual dimensions accounting for DPI and scroll
+  const dimensions = {
+      x: Math.round((rect.left + scrollLeft) * pixelRatio),
+      y: Math.round((rect.top + scrollTop) * pixelRatio),
+      width: Math.round(rect.width * pixelRatio),
+      height: Math.round(rect.height * pixelRatio)
+  };
+
+  // For full page, use scrollWidth/scrollHeight
+  if (element === document.documentElement) {
+      dimensions.width = Math.round(element.scrollWidth * pixelRatio);
+      dimensions.height = Math.round(element.scrollHeight * pixelRatio);
+  }
+
+  const response = await chrome.runtime.sendMessage({
+      type: 'captureScreenshot',
+      data: dimensions
+  });
+
+  // Convert array back to Blob
+  return new Blob([new Uint8Array(response.data)], {
+      type: response.type
   });
 }
 
@@ -227,11 +227,14 @@ async function captureAndSend(task) {
   if (!element) return;
 
   try {
-    const canvas = await html2canvas(element);
-    const blob = await new Promise(resolve => canvas.toBlob(resolve));
+    // const canvas = await html2canvas(element);
+    const screenshot = await captureElement(element);
+    // const blob = await new Promise(resolve => screenshot.toBlob(resolve));
+    // const screenshotBlob = screenshot instanceof Blob ? screenshot : 
+    //   await fetch(screenshot).then(r => r.blob());
     
     const formData = new FormData();
-    formData.append('screenshot', blob, 'screenshot.png');
+    formData.append('screenshot', screenshot, 'screenshot.png');
     
     await fetch(task.apiUrl, {
       method: 'POST',

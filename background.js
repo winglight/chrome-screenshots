@@ -1,4 +1,48 @@
 chrome.action.onClicked.addListener((tab) => {
+  chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      function: () => {
+          const sidebar = document.getElementById('screenshot-task-sidebar');
+          if (sidebar) {
+              chrome.storage.local.get(['sidebarVisible'], (result) => {
+                  const isVisible = result.sidebarVisible !== false;
+                  sidebar.style.display = isVisible ? 'none' : 'block';
+                  chrome.storage.local.set({ sidebarVisible: !isVisible });
+              });
+          } else {
+              injectSidebar();
+              chrome.storage.local.set({ sidebarVisible: true });
+          }
+      }
+  });
+});
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === 'captureScreenshot') {
+      chrome.tabs.captureVisibleTab(null, {format: 'png'}, async (dataUrl) => {
+          const image = await createImageBitmap(await (await fetch(dataUrl)).blob());
+          const canvas = new OffscreenCanvas(request.data.width, request.data.height);
+          const ctx = canvas.getContext('2d');
+          
+          ctx.drawImage(image,
+              request.data.x, request.data.y,
+              request.data.width, request.data.height,
+              0, 0,
+              request.data.width, request.data.height
+          );
+          
+          const blob = await canvas.convertToBlob({type: 'image/png'});
+          // Convert Blob to ArrayBuffer for message passing
+          const arrayBuffer = await blob.arrayBuffer();
+          sendResponse({
+              type: 'image/png',
+              data: Array.from(new Uint8Array(arrayBuffer))
+          });
+      });
+      return true; // Will respond asynchronously
+  }
+});
+
+chrome.action.onClicked.addListener((tab) => {
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
       function: injectSidebar
@@ -12,11 +56,12 @@ chrome.action.onClicked.addListener((tab) => {
           <div class="sidebar-header">
             <h2>Screenshot Tasks</h2>
             <button id="add-task-btn">Add Task</button>
+            <button id="close-sidebar-btn">Close</button>
           </div>
           <div id="task-list"></div>
         </div>
   
-        <div id="task-modal" class="modal">
+        <div id="task-modal" class="modal" style="display: none;">
           <div class="modal-content">
             <h3>Add/Edit Task</h3>
             <form id="task-form">
@@ -31,6 +76,7 @@ chrome.action.onClicked.addListener((tab) => {
               <div class="form-group">
                 <label>Interval:</label>
                 <select name="interval">
+                  <option value="60000">1 minutes</option>
                   <option value="300000">5 minutes</option>
                   <option value="900000">15 minutes</option>
                   <option value="1800000">30 minutes</option>
@@ -56,7 +102,7 @@ chrome.action.onClicked.addListener((tab) => {
             position: fixed;
             right: 0;
             top: 0;
-            width: 300px;
+            width: 400px;
             height: 100vh;
             background: white;
             box-shadow: -2px 0 5px rgba(0,0,0,0.2);
@@ -148,6 +194,10 @@ chrome.action.onClicked.addListener((tab) => {
             #add-task-btn {
             margin-bottom: 20px;
             }
+            
+            #close-sidebar-btn {
+            margin-bottom: 20px;
+            }
 
             .sidebar-header {
             display: flex;
@@ -159,6 +209,14 @@ chrome.action.onClicked.addListener((tab) => {
             .sidebar-header h2 {
             margin: 0;
             font-size: 20px;
+            }
+            #close-sidebar-btn {
+              background: #e2e2e2;
+              margin-left: 10px;
+            }
+            .sidebar-header > div {
+              display: flex;
+              gap: 10px;
             }
         </style>
         `;
