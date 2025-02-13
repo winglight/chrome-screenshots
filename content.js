@@ -202,7 +202,7 @@ async function captureElement(element) {
   const dimensions = {
       x: Math.round(rect.width * pixelRatio * 3 / 4),
       y: Math.round((rect.top + scrollTop) * pixelRatio),
-      width: Math.round(rect.width * pixelRatio * 3 / 4),
+      width: Math.round(rect.width * pixelRatio / 4),
       height: Math.round(rect.height * pixelRatio)
   };
 
