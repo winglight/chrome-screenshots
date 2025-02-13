@@ -40,24 +40,23 @@ function initializeTaskManager() {
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const formData = new FormData(form);
+    const editingTaskId = form.dataset.editTaskId;
+    
     const taskData = {
-      id: Date.now(),
+      id: editingTaskId ? parseInt(editingTaskId) : Date.now(),
       screenshotArea: formData.get('screenshotArea'),
       selector: formData.get('selector'),
       interval: parseInt(formData.get('interval')),
       apiUrl: formData.get('apiUrl'),
       apiToken: formData.get('apiToken'),
-      active: false
+      active: editingTaskId ? tasks[editingTaskId]?.active : false,
+      intervalId: editingTaskId ? tasks[editingTaskId]?.intervalId : null
     };
-
-    if (form.dataset.editTaskId && tasks[form.dataset.editTaskId]?.active) {
-      taskData.active = true;
-      taskData.intervalId = tasks[form.dataset.editTaskId].intervalId;
-    }
 
     tasks[taskData.id] = taskData;
     chrome.storage.local.set({ tasks });
     modal.style.display = 'none';
+    form.dataset.editTaskId = ''; // Clear the editing state
     renderTasks();
   });
 
@@ -145,6 +144,7 @@ function editTask(taskId) {
 
   const form = document.getElementById('task-form');
   const modal = document.getElementById('task-modal');
+  const selectorInput = form.querySelector('[name="selector"]');
 
   form.elements['screenshotArea'].value = task.screenshotArea;
   form.elements['selector'].value = task.selector;
@@ -152,7 +152,10 @@ function editTask(taskId) {
   form.elements['apiUrl'].value = task.apiUrl;
   form.elements['apiToken'].value = task.apiToken;
 
-  // 存储当前编辑的任务ID
+  // Show/hide selector input based on screenshotArea value
+  selectorInput.style.display = task.screenshotArea === 'selector' ? 'block' : 'none';
+
+  // Store editing task ID
   form.dataset.editTaskId = taskId;
 
   modal.style.display = 'flex';
@@ -197,9 +200,9 @@ async function captureElement(element) {
   
   // Calculate actual dimensions accounting for DPI and scroll
   const dimensions = {
-      x: Math.round((rect.left + scrollLeft) * pixelRatio),
+      x: Math.round(rect.width * pixelRatio * 3 / 4),
       y: Math.round((rect.top + scrollTop) * pixelRatio),
-      width: Math.round(rect.width * pixelRatio),
+      width: Math.round(rect.width * pixelRatio * 3 / 4),
       height: Math.round(rect.height * pixelRatio)
   };
 
