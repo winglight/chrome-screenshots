@@ -1,3 +1,40 @@
+let intervalTasks = {};
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === 'startTask') {
+        const task = request.task;
+        // Execute immediately
+        executeTask(task, sender.tab.id);
+        
+        // Set up interval
+        intervalTasks[task.id] = setInterval(() => {
+            executeTask(task, sender.tab.id);
+        }, task.interval);
+        
+        sendResponse({success: true});
+    }
+    
+    if (request.type === 'stopTask') {
+        if (intervalTasks[request.taskId]) {
+            clearInterval(intervalTasks[request.taskId]);
+            delete intervalTasks[request.taskId];
+        }
+        sendResponse({success: true});
+    }
+    return true;
+});
+
+async function executeTask(task, tabId) {
+    try {
+        chrome.tabs.sendMessage(tabId, {
+            type: 'executeTask',
+            task: task
+        });
+    } catch (error) {
+        console.error(`Task ${task.id} execution failed:`, error);
+    }
+}
+
 chrome.action.onClicked.addListener((tab) => {
   chrome.scripting.executeScript({
       target: { tabId: tab.id },

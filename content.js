@@ -125,17 +125,27 @@ function toggleTask(taskId) {
   task.active = !task.active;
   
   if (task.active) {
-    captureAndSend(task);
-    task.intervalId = setInterval(() => {
-      captureAndSend(task);
-    }, task.interval);
+    chrome.runtime.sendMessage({
+      type: 'startTask',
+      task: task
+    });
   } else {
-    clearInterval(task.intervalId);
+    chrome.runtime.sendMessage({
+      type: 'stopTask',
+      taskId: taskId
+    });
   }
   
   chrome.storage.local.set({ tasks });
   renderTasks();
 }
+
+// Add message listener for task execution
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === 'executeTask') {
+    captureAndSend(request.task);
+  }
+});
 
 // 修改 editTask 函数
 function editTask(taskId) {
