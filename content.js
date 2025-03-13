@@ -125,14 +125,30 @@ function toggleTask(taskId) {
   task.active = !task.active;
   
   if (task.active) {
+    console.log(`Activating task ${taskId}`);
     chrome.runtime.sendMessage({
       type: 'startTask',
       task: task
+    }, response => {
+      if (!response || !response.success) {
+        console.error('Failed to start task:', response ? response.error : 'Unknown error');
+        task.active = false;
+        renderTasks();
+      } else {
+        console.log(`Task ${taskId} started successfully`);
+      }
     });
   } else {
+    console.log(`Deactivating task ${taskId}`);
     chrome.runtime.sendMessage({
       type: 'stopTask',
       taskId: taskId
+    }, response => {
+      if (!response || !response.success) {
+        console.error('Failed to stop task:', response ? response.error : 'Unknown error');
+      } else {
+        console.log(`Task ${taskId} stopped successfully`);
+      }
     });
   }
   
@@ -239,9 +255,9 @@ async function captureElement(element) {
   
   // Calculate actual dimensions accounting for DPI and scroll
   const dimensions = {
-      x: Math.round(rect.width * pixelRatio * 3 / 4),
+      x: Math.round((rect.width + scrollLeft) * 3/4 * pixelRatio),
       y: Math.round((rect.top + scrollTop) * pixelRatio),
-      width: Math.round(rect.width * pixelRatio / 4),
+      width: Math.round(rect.width * 1/4 * pixelRatio),
       height: Math.round(rect.height * pixelRatio)
   };
 
@@ -251,10 +267,17 @@ async function captureElement(element) {
       dimensions.height = Math.round(element.scrollHeight * pixelRatio);
   }
 
+  console.log('截图区域:', dimensions);
+
   const response = await chrome.runtime.sendMessage({
       type: 'captureScreenshot',
       data: dimensions
   });
+
+  if (response.error) {
+    console.error('截图失败:', response.error);
+    throw new Error(response.error);
+  }
 
   // Convert array back to Blob
   return new Blob([new Uint8Array(response.data)], {
@@ -263,6 +286,7 @@ async function captureElement(element) {
 }
 
 async function captureAndSend(task) {
+  console.log(`开始执行任务 ${task.id}...`);
   let element = task.screenshotArea === 'full' ? document.documentElement : 
                 document.querySelector(task.selector);
   
@@ -284,13 +308,13 @@ async function captureAndSend(task) {
       apiToken: task.apiToken
     }, response => {
       if (response && response.success) {
-        console.log('截图发送成功');
+        console.log(`任务 ${task.id} 截图发送成功`);
       } else {
-        console.error('截图发送失败:', response ? response.error : '未知错误');
+        console.error(`任务 ${task.id} 截图发送失败:`, response ? response.error : '未知错误');
       }
     });
   } catch (error) {
-    console.error('Screenshot capture/send failed:', error);
+    console.error(`任务 ${task.id} 截图捕获/发送失败:`, error);
   }
 }
 

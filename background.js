@@ -55,10 +55,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const tabId = sender.tab ? sender.tab.id : null;
         
         if (tabId) {
+            console.log(`Starting task ${task.id} with interval ${task.interval}ms`);
+            
+            // 立即执行一次任务
             executeTask(task, tabId);
-            intervalTasks[task.id] = setInterval(() => {
-                executeTask(task, tabId);
-            }, task.interval);
+            
+            // 清除可能存在的旧定时器
+            if (intervalTasks[task.id]) {
+                clearInterval(intervalTasks[task.id]);
+                delete intervalTasks[task.id];
+            }
+            
+            // 清除可能存在的旧 alarm
+            chrome.alarms.clear(`task_${task.id}`);
+            
+            // 创建新的 alarm 代替 setInterval
+            chrome.alarms.create(`task_${task.id}`, {
+                periodInMinutes: task.interval / (60 * 1000),
+                delayInMinutes: task.interval / (60 * 1000)
+            });
+            
+            // 保存任务状态到存储
+            chrome.storage.local.get(['activeTasks'], (result) => {
+                const activeTasks = result.activeTasks || {};
+                activeTasks[task.id] = {
+                    tabId: tabId,
+                    lastRun: Date.now()
+                };
+                chrome.storage.local.set({ activeTasks });
+            });
+            
             sendResponse({success: true});
         } else {
             console.error('No tab ID found for task:', task);
@@ -68,13 +94,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     if (request.type === 'stopTask') {
+        console.log(`Stopping task ${request.taskId}`);
+        
+        // 清除 alarm
+        chrome.alarms.clear(`task_${request.taskId}`);
+        
+        // 清除可能存在的 setInterval
         if (intervalTasks[request.taskId]) {
             clearInterval(intervalTasks[request.taskId]);
             delete intervalTasks[request.taskId];
-            sendResponse({success: true});
-        } else {
-            sendResponse({success: false, error: 'Task not found'});
         }
+        
+        // 从存储中移除活动任务
+        chrome.storage.local.get(['activeTasks'], (result) => {
+            const activeTasks = result.activeTasks || {};
+            delete activeTasks[request.taskId];
+            chrome.storage.local.set({ activeTasks });
+        });
+        
+        sendResponse({success: true});
         return true;
     }
 
@@ -194,6 +232,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function executeTask(task, tabId) {
     try {
         console.log(`Executing task ${task.id} for tab ${tabId}`);
+        
+        // 首先激活目标标签页，确保截图在正确的标签页上进行
+        try {
+            await chrome.tabs.update(tabId, { active: true });
+            // 给页面一点时间加载和渲染
+            await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (error) {
+            console.error(`无法激活标签页 ${tabId}:`, error);
+        }
+        
+        // 然后发送消息执行截图任务
         chrome.tabs.sendMessage(tabId, {
             type: 'executeTask',
             task: task
@@ -203,4 +252,80 @@ async function executeTask(task, tabId) {
     } catch (error) {
         console.error(`Task ${task.id} execution failed:`, error);
     }
+}
+
+// 添加启动时恢复活动任务的功能
+chrome.runtime.onStartup.addListener(restoreActiveTasks);
+chrome.runtime.onInstalled.addListener(restoreActiveTasks);
+
+// 恢复活动任务的函数
+chrome.alarms.onAlarm.addListener((alarm) => {
+    console.log('Alarm triggered:', alarm.name);
+    
+    if (alarm.name.startsWith('task_')) {
+        const taskId = alarm.name.split('_')[1];
+        
+        chrome.storage.local.get(['tasks', 'activeTasks'], (result) => {
+            const tasks = result.tasks || {};
+            const activeTasks = result.activeTasks || {};
+            const task = tasks[taskId];
+            const activeInfo = activeTasks[taskId];
+            
+            if (task && task.active && activeInfo && activeInfo.tabId) {
+                console.log(`Executing alarm task ${taskId} for tab ${activeInfo.tabId}`);
+                executeTask(task, activeInfo.tabId);
+                
+                // 更新最后执行时间
+                activeTasks[taskId].lastRun = Date.now();
+                chrome.storage.local.set({ activeTasks });
+            } else {
+                console.log(`Task ${taskId} is no longer active, clearing alarm`);
+                chrome.alarms.clear(alarm.name);
+            }
+        });
+    }
+});
+
+// 修改 restoreActiveTasks 函数，使用 alarms API
+function restoreActiveTasks() {
+    console.log('Restoring active tasks...');
+    chrome.storage.local.get(['tasks', 'activeTasks'], (result) => {
+        const tasks = result.tasks || {};
+        const activeTasks = result.activeTasks || {};
+        
+        // 清除所有现有的 alarms
+        chrome.alarms.clearAll();
+        
+        // 遍历所有活动任务
+        Object.keys(activeTasks).forEach(taskId => {
+            const task = tasks[taskId];
+            const activeInfo = activeTasks[taskId];
+            
+            if (task && task.active && activeInfo.tabId) {
+                console.log(`Restoring task ${taskId} for tab ${activeInfo.tabId}`);
+                
+                // 检查标签页是否仍然存在
+                chrome.tabs.get(activeInfo.tabId, (tab) => {
+                    if (!chrome.runtime.lastError && tab) {
+                        // 创建新的 alarm
+                        chrome.alarms.create(`task_${taskId}`, {
+                            periodInMinutes: task.interval / (60 * 1000),
+                            delayInMinutes: task.interval / (60 * 1000)
+                        });
+                        
+                        console.log(`Alarm created for task ${taskId} with interval ${task.interval}ms`);
+                    } else {
+                        // 标签页不存在，清除任务状态
+                        console.log(`Tab ${activeInfo.tabId} for task ${taskId} no longer exists`);
+                        delete activeTasks[taskId];
+                        task.active = false;
+                        chrome.storage.local.set({ 
+                            activeTasks,
+                            tasks
+                        });
+                    }
+                });
+            }
+        });
+    });
 }
