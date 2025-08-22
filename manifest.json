@@ -17,9 +17,7 @@
       "default_title": "Screenshot Task Manager"
     },
     "background": {
-      "service_worker": "background.js",
-      "type": "module",
-      "persistent": false
+      "service_worker": "background.js"
     },
     "content_scripts": [
       {

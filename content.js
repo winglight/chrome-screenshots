@@ -160,87 +160,45 @@ function toggleTask(taskId) {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'executeTask') {
     captureAndSend(request.task);
+    return;
   }
   if (request.type === 'toggleSidebar') {
-    console.log('收到 toggleSidebar 消息');
+    // 打开或关闭设置面板
+    injectSidebar();
     const sidebar = document.getElementById('screenshot-task-sidebar');
     if (sidebar) {
-      // 如果侧边栏已存在，切换其显示状态
-      chrome.storage.local.get(['sidebarVisible'], (result) => {
-        const isVisible = result.sidebarVisible !== false;
-        console.log('当前侧边栏状态:', isVisible ? '显示' : '隐藏');
-        sidebar.style.display = isVisible ? 'none' : 'block';
-        chrome.storage.local.set({ sidebarVisible: !isVisible });
-      });
+      const visible = sidebar.style.display !== 'none';
+      sidebar.style.display = visible ? 'none' : 'block';
+      chrome.storage.local.set({ sidebarVisible: !visible });
+      sendResponse && sendResponse({ success: true, visible: !visible });
     } else {
-      // 如果侧边栏不存在，注入并显示
-      console.log('侧边栏不存在，正在注入...');
-      injectSidebar();
-      // 确保侧边栏显示
-      setTimeout(() => {
-        const newSidebar = document.getElementById('screenshot-task-sidebar');
-        if (newSidebar) {
-          newSidebar.style.display = 'block';
-          chrome.storage.local.set({ sidebarVisible: true });
+      sendResponse && sendResponse({ success: false });
+    }
+    return true;
+  }
+  if (request.type === 'composeInChatGPT') {
+    (async () => {
+      try {
+        if (!/chat\.openai\.com$|chatgpt\.com$/i.test(location.hostname)) {
+          sendResponse({ success: false, error: 'Not ChatGPT domain' });
+          return;
         }
-      }, 100);
-    }
-    // 发送响应表示消息已处理
-    if (sendResponse) {
-      sendResponse({ success: true });
-    }
+        if (request.imageDataUrl) {
+          await attachImageToChatGPT(request.imageDataUrl);
+          await new Promise(r => setTimeout(r, 900));
+        }
+        if (typeof request.text === 'string') {
+          await fillTextAndSend(request.text);
+        }
+        sendResponse({ success: true });
+      } catch (e) {
+        console.error('composeInChatGPT error:', e);
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
   }
 });
-
-// 修改 editTask 函数
-function editTask(taskId) {
-  const task = tasks[taskId];
-  if (!task) return;
-
-  const form = document.getElementById('task-form');
-  const modal = document.getElementById('task-modal');
-  const selectorInput = form.querySelector('[name="selector"]');
-
-  form.elements['screenshotArea'].value = task.screenshotArea;
-  form.elements['selector'].value = task.selector;
-  form.elements['interval'].value = task.interval;
-  form.elements['apiUrl'].value = task.apiUrl;
-  form.elements['apiToken'].value = task.apiToken;
-
-  // Show/hide selector input based on screenshotArea value
-  selectorInput.style.display = task.screenshotArea === 'selector' ? 'block' : 'none';
-
-  // Store editing task ID
-  form.dataset.editTaskId = taskId;
-
-  modal.style.display = 'flex';
-}
-
-// 修改 deleteTask 函数
-function deleteTask(taskId) {
-  const task = tasks[taskId];
-  if (!task) return;
-
-  if (task.active) {
-    clearInterval(task.intervalId);
-  }
-  
-  delete tasks[taskId];
-  chrome.storage.local.set({ tasks });
-  renderTasks();
-}
-
-function stopAllTasks() {
-  Object.values(tasks).forEach(task => {
-    if (task.active) {
-      clearInterval(task.intervalId);
-      task.active = false;
-    }
-  });
-  chrome.storage.local.set({ tasks });
-}
-
-
 
 async function captureElement(element) {
   // Get device pixel ratio for scaling
@@ -254,24 +212,29 @@ async function captureElement(element) {
   const rect = element.getBoundingClientRect();
   
   // Calculate actual dimensions accounting for DPI and scroll
-  const dimensions = {
-      x: Math.round((rect.width + scrollLeft) * 3/4 * pixelRatio),
-      y: Math.round((rect.top + scrollTop) * pixelRatio),
-      width: Math.round(rect.width * 1/4 * pixelRatio),
-      height: Math.round(rect.height * pixelRatio)
-  };
-
-  // For full page, use scrollWidth/scrollHeight
+  const dpr = window.devicePixelRatio || 1;
+  let dimensions;
   if (element === document.documentElement) {
-      dimensions.width = Math.round(element.scrollWidth * pixelRatio);
-      dimensions.height = Math.round(element.scrollHeight * pixelRatio);
+    dimensions = {
+      x: 0,
+      y: 0,
+      width: Math.round(window.innerWidth * dpr),
+      height: Math.round(window.innerHeight * dpr)
+    };
+  } else {
+    dimensions = {
+      x: Math.round((rect.left) * dpr),
+      y: Math.round((rect.top) * dpr),
+      width: Math.round(rect.width * dpr),
+      height: Math.round(rect.height * dpr)
+    };
   }
 
   console.log('截图区域:', dimensions);
 
-  const response = await chrome.runtime.sendMessage({
-      type: 'captureScreenshot',
-      data: dimensions
+  const response = await sendMessageSafe({
+    type: 'captureScreenshot',
+    data: dimensions
   });
 
   if (response.error) {
@@ -328,50 +291,387 @@ function blobToBase64(blob) {
   });
 }
 
-// 添加 injectSidebar 函数定义
+// 新增：全局设置与快捷键（顶层）
+let settings = {
+  screenshotArea: 'full',
+  selector: '',
+  hotkey: 'Ctrl+Shift+S',
+  texts: [''],
+  targetChatGPTTabId: null,
+  autoEnterSend: false,
+};
+let hotkeyListenerAttached = false;
+let currentHotkey = null;
+
+// 等待工具：轮询直到 predicate 返回非空或超时
+async function waitFor(predicate, timeout = 4000, interval = 150) {
+  const end = Date.now() + timeout;
+  let last;
+  while (Date.now() < end) {
+    try {
+      last = await predicate();
+      if (last) return last;
+    } catch {}
+    await new Promise(r => setTimeout(r, interval));
+  }
+  return last || null;
+}
+
+function isVisible(el) {
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  if (style.visibility === 'hidden' || style.display === 'none') return false;
+  const rects = el.getClientRects();
+  return rects && rects.length > 0;
+}
+
+function isTradingViewChartUrl() {
+  try {
+    return /tradingview\.com$/i.test(location.hostname) && location.pathname.startsWith('/chart');
+  } catch { return false; }
+}
+
+function normalizeHotkey(str) {
+  return String(str || '').replace(/\s+/g, '').toLowerCase();
+}
+
+function eventToHotkey(e) {
+  const parts = [];
+  if (e.ctrlKey) parts.push('ctrl');
+  if (e.metaKey) parts.push('meta');
+  if (e.shiftKey) parts.push('shift');
+  if (e.altKey) parts.push('alt');
+  const key = e.key && e.key.length === 1 ? e.key.toUpperCase() : (e.key || '').toUpperCase();
+  if (key && !['CONTROL','META','SHIFT','ALT'].includes(key)) parts.push(key);
+  return normalizeHotkey(parts.join('+'));
+}
+
+function applyHotkeyListener() {
+  const wanted = normalizeHotkey(settings.hotkey);
+  currentHotkey = wanted;
+  if (hotkeyListenerAttached) return;
+  window.addEventListener('keydown', async (e) => {
+    try {
+      if (!isTradingViewChartUrl()) return;
+      const pressed = eventToHotkey(e);
+      if (pressed === currentHotkey) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.debug('[chrome-screenshots] Hotkey matched, starting capture flow');
+        await startCaptureFlow();
+      }
+    } catch {}
+  }, true);
+  hotkeyListenerAttached = true;
+}
+
+function loadSettings(callback) {
+  chrome.storage.local.get(['settings'], (res) => {
+    const defaults = { screenshotArea: 'full', selector: '', hotkey: 'Ctrl+Shift+S', texts: [''], targetChatGPTTabId: null, autoEnterSend: false };
+    settings = Object.assign({}, defaults, res.settings || {});
+    applyHotkeyListener();
+    if (typeof callback === 'function') callback(settings);
+  });
+}
+
+function saveSettings(newSettings, callback) {
+  settings = Object.assign({}, settings, newSettings || {});
+  chrome.storage.local.set({ settings }, () => {
+    applyHotkeyListener();
+    if (typeof callback === 'function') callback();
+  });
+}
+
+async function startCaptureFlow() {
+  try {
+    const element = settings.screenshotArea === 'full' ? document.documentElement : document.querySelector(settings.selector);
+    if (!element) {
+      console.error('未找到选择的元素用于截图:', settings.selector);
+      return;
+    }
+
+    // 先触发截图，让后台尽快完成可见区域快照；随后稍作延迟再显示对话框，避免弹框被截入
+    const capturePromise = (async () => {
+      try {
+        const screenshotBlob = await captureElement(element);
+        return await blobToBase64(screenshotBlob);
+      } catch (e) {
+        console.error('截图失败（将仅发送文本）:', e);
+        return null;
+      }
+    })();
+
+    // 给截图一个微小的时间窗口，尽量在对话框出现前完成屏幕快照
+    await new Promise(r => setTimeout(r, 160));
+
+    // 弹框与编码可并行进行（截图快照已在之前触发）
+    const chosenText = await showTextSelectionModal(settings.texts || []);
+    if (chosenText == null) return; // 用户取消
+
+    // 追加保存新输入的文本（去重）
+    const trimmed = String(chosenText || '').trim();
+    if (trimmed) {
+      const arr = Array.isArray(settings.texts) ? settings.texts.slice() : [];
+      if (!arr.includes(trimmed)) {
+        arr.push(trimmed);
+        saveSettings({ texts: arr });
+      }
+    }
+
+    const dataUrl = await capturePromise; // 若截图失败则为 null
+
+    const resp = await sendMessageSafe({
+      type: 'sendToChatGPT',
+      imageDataUrl: dataUrl || null,
+      text: trimmed,
+      targetTabId: settings.targetChatGPTTabId || null,
+    });
+    if (!resp || !resp.success) {
+      console.error('发送到 ChatGPT 失败:', resp?.error);
+    }
+  } catch (err) {
+    console.error('自动截图流程失败:', err);
+  }
+}
+
+async function attachImageToChatGPT(dataUrl) {
+  const resp = await fetch(dataUrl);
+  const blob = await resp.blob();
+  const file = new File([blob], 'screenshot.png', { type: blob.type || 'image/png' });
+  const dt = new DataTransfer();
+  dt.items.add(file);
+
+  const findFileInput = () => document.querySelector('input[type="file"][accept*="image" i]') || document.querySelector('input[type="file"]');
+
+  let input = findFileInput();
+  if (!input) {
+    // 尝试点击“添加附件/上传”按钮以触发文件输入出现
+    const attachBtn = document.querySelector('button[aria-label*="attach" i],button[aria-label*="upload" i],button[aria-label*="上传" i],button[aria-label*="添加附件" i],button[data-testid*="attach" i]');
+    if (attachBtn) {
+      attachBtn.click();
+      input = await waitFor(() => findFileInput(), 2500, 150);
+    }
+  }
+  if (!input) throw new Error('未找到图片上传控件');
+
+  input.files = dt.files;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+async function fillTextAndSend(text) {
+  function findTargetsAll() {
+    const textareas = Array.from(document.querySelectorAll('textarea[data-testid="prompt-textarea"], form textarea'));
+    const editables = Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"], div[contenteditable="true"][data-lexical-editor], [contenteditable="true"]'));
+    const visTextarea = textareas.find(isVisible) || null;
+    const visEditable = editables.find(isVisible) || null;
+    return { textarea: visTextarea, editable: visEditable };
+  }
+
+  // 等待输入区域可用
+  let { textarea, editable } = findTargetsAll();
+  if (!textarea && !editable) {
+    const res = await waitFor(() => {
+      const t = findTargetsAll();
+      return (t.textarea || t.editable) ? t : null;
+    }, 6000, 150);
+    if (res) { textarea = res.textarea; editable = res.editable; }
+  }
+  if (!textarea && !editable) {
+    throw new Error('未找到对话输入框');
+  }
+
+  // 文本插入逻辑（带校验与多策略）
+  const want = String(text || '');
+  let ok = false;
+
+  if (textarea) {
+    textarea.focus();
+    try {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+      if (setter) setter.call(textarea, want); else textarea.value = want;
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      ok = (textarea.value || '') === want;
+      if (!ok) {
+        // 退化方案：使用 setRangeText
+        try {
+          textarea.value = '';
+          textarea.setRangeText(want);
+          textarea.dispatchEvent(new Event('input', { bubbles: true }));
+          ok = (textarea.value || '') === want;
+        } catch {}
+      }
+    } catch {}
+  }
+
+  if (!ok && editable) {
+    editable.focus();
+    try {
+      // 优先用 selection + execCommand 插入
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.execCommand('insertText', false, want);
+      editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      ok = (editable.innerText || '').includes(want);
+    } catch {}
+
+    if (!ok) {
+      try {
+        // 尝试 beforeinput
+        const ev = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: want });
+        editable.dispatchEvent(ev);
+        editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        ok = (editable.innerText || '').includes(want);
+      } catch {}
+    }
+
+    if (!ok) {
+      try {
+        editable.innerHTML = '';
+        editable.appendChild(document.createTextNode(want));
+        editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        ok = (editable.innerText || '').includes(want);
+      } catch {}
+    }
+  }
+
+  if (!ok) {
+    throw new Error('写入文本失败');
+  }
+
+  // 等待 UI 处理输入
+  await new Promise(r => setTimeout(r, 250));
+
+  // 如果用户偏好“自动按回车发送”，优先回车
+  const target = textarea || editable;
+  if (settings && settings.autoEnterSend && target) {
+    const evt = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+    target.dispatchEvent(evt);
+    return;
+  }
+
+  // 查找发送按钮并点击；若找不到或按钮禁用则回车
+  const findSendBtn = () => {
+    const btn = document.querySelector('button[data-testid="send-button"], form button[type="submit"], button[aria-label*="Send" i], button[aria-label*="发送" i]');
+    if (!btn) return null;
+    const ariaDisabled = btn.getAttribute('aria-disabled');
+    const disabled = btn.disabled || ariaDisabled === 'true' || btn.getAttribute('data-state') === 'disabled';
+    return (isVisible(btn) ? btn : null) && !disabled ? btn : btn; // 返回按钮本身，后续再判断可用性
+  };
+  let sendBtn = findSendBtn();
+  if (!sendBtn) {
+    sendBtn = await waitFor(() => findSendBtn(), 3000, 150);
+  }
+
+  // 如果按钮存在但当前不可用，则等待其变为可用
+  if (sendBtn) {
+    const enabled = await waitFor(() => {
+      const btn = findSendBtn();
+      if (!btn) return null;
+      const ariaDisabled = btn.getAttribute('aria-disabled');
+      const disabled = btn.disabled || ariaDisabled === 'true' || btn.getAttribute('data-state') === 'disabled';
+      return !disabled && isVisible(btn) ? btn : null;
+    }, 5000, 150);
+    if (enabled) sendBtn = enabled;
+  }
+
+  if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
+    sendBtn.click();
+  } else {
+    const evt = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+    target?.dispatchEvent(evt);
+  }
+}
+
+function showTextSelectionModal(texts) {
+  return new Promise((resolve) => {
+    const id = 'text-select-modal';
+    let modal = document.getElementById(id);
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = id;
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2147483647;display:flex;align-items:center;justify-content:center';
+      modal.innerHTML = `
+        <div style="background:#fff;padding:20px;border-radius:8px;width:360px;max-width:90%">
+          <h3 style="margin-top:0;margin-bottom:12px">选择或输入文本</h3>
+          <input id="text-select-modal-input" list="text-select-modal-datalist" placeholder="选择或输入..." style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px" />
+          <datalist id="text-select-modal-datalist"></datalist>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button id="text-select-cancel" style="padding:6px 12px">取消</button>
+            <button id="text-select-ok" style="padding:6px 12px;background:#4a90e2;color:#fff;border:none;border-radius:4px">确定</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+    }
+    const input = modal.querySelector('#text-select-modal-input');
+    const datalist = modal.querySelector('#text-select-modal-datalist');
+    datalist.innerHTML = '';
+    (texts && texts.length ? texts : ['']).forEach((t) => {
+      const opt = document.createElement('option');
+      opt.value = t;
+      datalist.appendChild(opt);
+    });
+    input.value = '';
+    modal.style.display = 'flex';
+    console.debug('[chrome-screenshots] Text selection modal displayed');
+    setTimeout(() => input.focus(), 0);
+    const cleanup = () => { modal.style.display = 'none'; };
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') { const val = input.value; cleanup(); resolve(val); }
+      if (e.key === 'Escape') { cleanup(); resolve(null); }
+    };
+    modal.querySelector('#text-select-cancel').onclick = () => { cleanup(); resolve(null); };
+    modal.querySelector('#text-select-ok').onclick = () => { const val = input.value; cleanup(); resolve(val); };
+  });
+}
+
+// 初始化设置（不显示侧边栏，仅绑定热键）
+loadSettings();
+
 function injectSidebar() {
   if (!document.getElementById('screenshot-task-sidebar')) {
     const sidebarHTML = `
       <div id="screenshot-task-sidebar" style="display: block;">
         <div class="sidebar-header">
-          <h2>Screenshot Tasks</h2>
-          <button id="add-task-btn">Add Task</button>
-          <button id="close-sidebar-btn">Close</button>
+          <h2>截图设置</h2>
+          <div>
+            <button id="refresh-chatgpt-tabs-btn">刷新 ChatGPT 标签</button>
+            <button id="close-sidebar-btn">关闭</button>
+          </div>
         </div>
-        <div id="task-list"></div>
-      </div>
-
-      <div id="task-modal" class="modal" style="display: none;">
-        <div class="modal-content">
-          <h3>Add/Edit Task</h3>
-          <form id="task-form">
-            <div class="form-group">
-              <label>Screenshot Area:</label>
-              <select name="screenshotArea">
-                <option value="full">Full Page</option>
-                <option value="selector">CSS Selector</option>
-              </select>
-              <input type="text" name="selector" placeholder="Enter CSS selector" style="display:none">
-            </div>
-            <div class="form-group">
-              <label>Interval:</label>
-              <select name="interval">
-                <option value="60000">1 minutes</option>
-                <option value="300000">5 minutes</option>
-                <option value="900000">15 minutes</option>
-                <option value="1800000">30 minutes</option>
-                <option value="3600000">1 hour</option>
-                <option value="86400000">1 day</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>API Endpoint:</label>
-              <input type="url" name="apiUrl" required>
-              <input type="text" name="apiToken" placeholder="API Token" required>
-            </div>
-            <button type="submit">Save Task</button>
-            <button type="button" class="cancel-btn">Cancel</button>
-          </form>
+        <div class="form-group">
+          <label>截图区域</label>
+          <select id="cfg-screenshot-area">
+            <option value="full">整页</option>
+            <option value="selector">CSS 选择器</option>
+          </select>
+          <input type="text" id="cfg-selector" placeholder="输入 CSS 选择器，如 #chart-container" style="display:none;margin-top:8px" />
+        </div>
+        <div class="form-group">
+          <label>快捷键</label>
+          <input type="text" id="cfg-hotkey" placeholder="Ctrl+Shift+S" />
+          <div style="font-size:12px;color:#666;margin-top:6px">在输入框中按下你想要的组合键；示例：Ctrl+Shift+S</div>
+        </div>
+        <div class="form-group">
+          <label>预设文本</label>
+          <div id="cfg-texts-container" style="display:flex;flex-direction:column;gap:8px"></div>
+          <button id="cfg-add-text" style="margin-top:8px">新增一条文本</button>
+        </div>
+        <div class="form-group">
+          <label>ChatGPT 标签页</label>
+          <select id="chatgpt-tabs-select"></select>
+        </div>
+        <div class="form-group">
+          <label>
+            <input type="checkbox" id="cfg-auto-enter" /> 自动按回车发送消息（默认关闭）
+          </label>
+          <div style="font-size:12px;color:#666;margin-top:6px">开启后将优先通过回车键触发发送；关闭时优先点击发送按钮</div>
+        </div>
+        <div class="form-group">
+          <button id="cfg-save-settings" style="width:100%;background:#16a34a">保存</button>
         </div>
       </div>
     `;
@@ -379,132 +679,315 @@ function injectSidebar() {
     const style = `
       <style>
           #screenshot-task-sidebar {
-          position: fixed;
-          right: 0;
-          top: 0;
-          width: 400px;
-          height: 100vh;
-          background: white;
-          box-shadow: -2px 0 5px rgba(0,0,0,0.2);
-          z-index: 10000;
-          padding: 20px;
-          box-sizing: border-box;
-          }
-
-          .modal {
-          display: none;
-          position: fixed;
-          top: 0;
-          left: 0;
-          width: 100%;
-          height: 100%;
-          background: rgba(0,0,0,0.5);
-          z-index: 10001;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          }
-
-          .modal-content {
-          background: white;
-          width: 400px;
-          max-width: 90%;
-          padding: 25px;
-          border-radius: 8px;
-          box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-          position: relative;
-          }
-
-          .form-group {
-          margin-bottom: 20px;
-          }
-
-          .form-group label {
-          display: block;
-          margin-bottom: 8px;
-          font-weight: bold;
-          }
-
-          .form-group select,
-          .form-group input {
-          width: 100%;
-          padding: 8px;
-          border: 1px solid #ddd;
-          border-radius: 4px;
-          box-sizing: border-box;
-          }
-
-          .task-item {
-          border: 1px solid #ddd;
-          padding: 15px;
-          margin-bottom: 15px;
-          border-radius: 5px;
-          background: #f9f9f9;
-          }
-
-          .task-controls {
-          margin-top: 15px;
-          display: flex;
-          gap: 10px;
-          }
-
-          button {
-          padding: 8px 16px;
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          background: #4a90e2;
-          color: white;
-          font-size: 14px;
-          }
-
-          button:hover {
-          background: #357abd;
-          }
-
-          .cancel-btn {
-          background: #e2e2e2;
-          color: #333;
-          }
-
-          .cancel-btn:hover {
-          background: #d1d1d1;
-          }
-
-          #add-task-btn {
-          margin-bottom: 20px;
-          }
-          
-          #close-sidebar-btn {
-          margin-bottom: 20px;
+            position: fixed;
+            right: 0;
+            top: 0;
+            width: 420px;
+            height: 100vh;
+            background: #fff;
+            box-shadow: -2px 0 5px rgba(0,0,0,0.15);
+            z-index: 10000;
+            padding: 20px;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
           }
 
           .sidebar-header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+          }
+          .sidebar-header h2 { margin: 0; font-size: 18px; }
+          .sidebar-header > div { display: flex; gap: 10px; }
+
+          .form-group { margin-bottom: 16px; }
+          .form-group label { display:block; margin-bottom: 8px; font-weight: 600; }
+          .form-group select, .form-group input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
           }
 
-          .sidebar-header h2 {
-          margin: 0;
-          font-size: 20px;
+          button {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            background: #4a90e2;
+            color: white;
+            font-size: 14px;
           }
-          #close-sidebar-btn {
-            background: #e2e2e2;
-            margin-left: 10px;
-          }
-          .sidebar-header > div {
-            display: flex;
-            gap: 10px;
-          }
+          button:hover { background: #357abd; }
+
+          #close-sidebar-btn { background: #e2e2e2; color:#333; }
+          #close-sidebar-btn:hover { background: #d1d1d1; }
+
+          .text-row { display:flex; gap:8px; align-items:center; }
+          .text-row input { flex:1; }
+          .remove-text { background:#f44336; }
+          .remove-text:hover { background:#d32f2f; }
       </style>
-      `;
+    `;
 
     document.body.insertAdjacentHTML('beforeend', sidebarHTML);
     document.head.insertAdjacentHTML('beforeend', style);
 
-    console.log('侧边栏已注入，正在初始化...');
-    initializeTaskManager();
+    initializeSettingsPanel();
   }
+}
+
+function initializeSettingsPanel() {
+  const sidebar = document.getElementById('screenshot-task-sidebar');
+  if (!sidebar) return;
+
+  const areaSel = sidebar.querySelector('#cfg-screenshot-area');
+  const selectorInput = sidebar.querySelector('#cfg-selector');
+  const hotkeyInput = sidebar.querySelector('#cfg-hotkey');
+  const textsContainer = sidebar.querySelector('#cfg-texts-container');
+  const addTextBtn = sidebar.querySelector('#cfg-add-text');
+  const tabsSelect = sidebar.querySelector('#chatgpt-tabs-select');
+  const refreshTabsBtn = sidebar.querySelector('#refresh-chatgpt-tabs-btn');
+  const closeBtn = sidebar.querySelector('#close-sidebar-btn');
+  const saveBtn = sidebar.querySelector('#cfg-save-settings');
+  const autoEnterCheckbox = sidebar.querySelector('#cfg-auto-enter');
+
+  let draft = null; // 草稿设置，点击保存时一次性提交
+  let dragIndex = null;
+
+  const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const formatHotkeyForDisplay = (normalized) => {
+    const parts = String(normalized || '').split('+').filter(Boolean);
+    return parts.map(p => {
+      const up = p.toLowerCase();
+      if (["ctrl","shift","alt","meta"].includes(up)) return capitalize(up);
+      return up.length === 1 ? up.toUpperCase() : capitalize(up);
+    }).join('+');
+  };
+
+  function renderTexts(textsArr) {
+    textsContainer.innerHTML = '';
+    (textsArr && textsArr.length ? textsArr : ['']).forEach((t, idx) => {
+      const row = document.createElement('div');
+      row.className = 'text-row';
+      row.setAttribute('draggable', 'true');
+      row.dataset.index = String(idx);
+      row.innerHTML = `
+        <input type="text" data-index="${idx}" value="${(t || '').replace(/"/g, '&quot;')}">
+        <button class="remove-text" data-index="${idx}">删除</button>
+      `;
+      textsContainer.appendChild(row);
+    });
+  }
+
+  function collectTexts() {
+    const inputs = textsContainer.querySelectorAll('input[type="text"][data-index]');
+    return Array.from(inputs).map(i => i.value || '');
+  }
+
+  function refreshChatGPTTabs(selectedId) {
+    tabsSelect.innerHTML = '';
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = '自动选择（当前活动的 ChatGPT 标签）';
+    tabsSelect.appendChild(autoOpt);
+
+    if (!chrome?.runtime?.id) {
+      console.warn('扩展上下文不可用，无法刷新 ChatGPT 标签列表');
+      return;
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: 'listChatGPTTabs' }, (resp) => {
+        if (chrome.runtime.lastError) {
+          console.warn('listChatGPTTabs 调用失败：', chrome.runtime.lastError.message || chrome.runtime.lastError);
+          return;
+        }
+        const tabs = (resp && resp.success && Array.isArray(resp.tabs)) ? resp.tabs : [];
+        let activeId = '';
+        tabs.forEach(t => {
+          const opt = document.createElement('option');
+          opt.value = String(t.id);
+          opt.textContent = `${t.active ? '[活动] ' : ''}${t.title || t.url || 'ChatGPT'} (ID: ${t.id})`;
+          tabsSelect.appendChild(opt);
+          if (t.active) activeId = String(t.id);
+        });
+        if (selectedId != null && selectedId !== undefined && selectedId !== '') {
+          tabsSelect.value = String(selectedId);
+        } else if (activeId) {
+          tabsSelect.value = activeId;
+        } else {
+          tabsSelect.value = '';
+        }
+      });
+    } catch (e) {
+      console.warn('刷新 ChatGPT 标签时出现异常：', e);
+    }
+  }
+
+  // 绑定事件
+  closeBtn.addEventListener('click', () => {
+    sidebar.style.display = 'none';
+    chrome.storage.local.set({ sidebarVisible: false });
+  });
+
+  addTextBtn.addEventListener('click', () => {
+    const next = collectTexts().concat('');
+    draft.texts = next;
+    renderTexts(draft.texts);
+  });
+
+  // 文本输入变更（不立刻保存，只更新草稿）
+  textsContainer.addEventListener('input', (e) => {
+    if (e.target && e.target.matches('input[type="text"][data-index]')) {
+      draft.texts = collectTexts();
+    }
+  });
+
+  // 删除一条文本（不立刻保存）
+  textsContainer.addEventListener('click', (e) => {
+    if (e.target && e.target.classList.contains('remove-text')) {
+      const idx = Number(e.target.getAttribute('data-index'));
+      const arr = collectTexts();
+      arr.splice(idx, 1);
+      draft.texts = arr;
+      renderTexts(draft.texts);
+    }
+  });
+
+  // 拖拽排序
+  textsContainer.addEventListener('dragstart', (e) => {
+    const row = e.target.closest('.text-row');
+    if (!row) return;
+    dragIndex = Number(row.dataset.index || row.querySelector('input')?.dataset.index || 0);
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  textsContainer.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+  });
+  textsContainer.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const targetRow = e.target.closest('.text-row');
+    if (!targetRow || dragIndex == null) return;
+    const targetIndex = Number(targetRow.dataset.index || targetRow.querySelector('input')?.dataset.index || 0);
+    if (targetIndex === dragIndex) return;
+    const arr = collectTexts();
+    const [moved] = arr.splice(dragIndex, 1);
+    arr.splice(targetIndex, 0, moved);
+    draft.texts = arr;
+    renderTexts(draft.texts);
+    dragIndex = null;
+  });
+  textsContainer.addEventListener('dragend', () => { dragIndex = null; });
+
+  areaSel.addEventListener('change', () => {
+    const val = areaSel.value;
+    selectorInput.style.display = val === 'selector' ? 'block' : 'none';
+    draft.screenshotArea = val;
+  });
+  selectorInput.addEventListener('input', () => {
+    draft.selector = selectorInput.value;
+  });
+
+  hotkeyInput.addEventListener('keydown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const parts = [];
+    if (e.ctrlKey) parts.push('Ctrl');
+    if (e.metaKey) parts.push('Meta');
+    if (e.shiftKey) parts.push('Shift');
+    if (e.altKey) parts.push('Alt');
+    const key = e.key && e.key.length === 1 ? e.key.toUpperCase() : (e.key || '').toUpperCase();
+    if (key && !['CONTROL','META','SHIFT','ALT'].includes(key)) parts.push(key);
+    const display = parts.join('+') || 'Ctrl+Shift+S';
+    hotkeyInput.value = display;
+    draft.hotkey = display;
+  }, true);
+
+  refreshTabsBtn.addEventListener('click', () => {
+    refreshChatGPTTabs(tabsSelect.value || '');
+  });
+
+  tabsSelect.addEventListener('change', () => {
+    const val = tabsSelect.value;
+    draft.targetChatGPTTabId = val ? Number(val) : null;
+  });
+
+  autoEnterCheckbox.addEventListener('change', () => {
+    draft.autoEnterSend = !!autoEnterCheckbox.checked;
+  });
+
+  // 保存按钮：一次性保存草稿
+  saveBtn.addEventListener('click', () => {
+    // 最终收集 UI 值，避免遗漏
+    draft.texts = collectTexts();
+    draft.selector = selectorInput.value;
+    draft.screenshotArea = areaSel.value;
+    draft.targetChatGPTTabId = tabsSelect.value ? Number(tabsSelect.value) : null;
+    draft.autoEnterSend = !!autoEnterCheckbox.checked;
+    saveSettings(draft, () => {
+      console.log('设置已保存');
+    });
+  });
+
+  // 初始化填充
+  loadSettings((s) => {
+    draft = JSON.parse(JSON.stringify(s));
+    areaSel.value = draft.screenshotArea || 'full';
+    selectorInput.style.display = areaSel.value === 'selector' ? 'block' : 'none';
+    selectorInput.value = draft.selector || '';
+    hotkeyInput.value = formatHotkeyForDisplay((draft.hotkey || 'Ctrl+Shift+S').replace(/\s+/g, '').toLowerCase());
+    renderTexts(Array.isArray(draft.texts) ? draft.texts : ['']);
+    refreshChatGPTTabs(draft.targetChatGPTTabId != null ? String(draft.targetChatGPTTabId) : '');
+    autoEnterCheckbox.checked = !!draft.autoEnterSend;
+  });
+}
+
+// 避免旧版侧边栏覆盖新设置面板
+function injectSidebar_legacy_disabled() {
+  console.warn('Legacy task sidebar is disabled.');
+}
+
+
+function isRecoverableRuntimeError(msg) {
+  const m = String(msg || '').toLowerCase();
+  return [
+    'extension context invalidated',
+    'receiving end does not exist',
+    'could not establish connection',
+    'message port closed',
+    'no receiving end',
+    'message channel closed'
+  ].some(s => m.includes(s));
+}
+
+function sendMessageSafe(payload, retries = 3, delay = 600) {
+  return new Promise((resolve, reject) => {
+    const attempt = (left) => {
+      try {
+        chrome.runtime.sendMessage(payload, (resp) => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            if (left > 0 && isRecoverableRuntimeError(err.message)) {
+              setTimeout(() => attempt(left - 1), delay);
+            } else {
+              reject(new Error(err.message || 'sendMessage failed'));
+            }
+          } else {
+            resolve(resp);
+          }
+        });
+      } catch (e) {
+        if (left > 0 && isRecoverableRuntimeError(e.message)) {
+          setTimeout(() => attempt(left - 1), delay);
+        } else {
+          reject(e);
+        }
+      }
+    };
+    attempt(retries);
+  });
 }

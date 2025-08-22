@@ -226,6 +226,107 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         
         return true; // 表示将异步发送响应
     }
+    if (request && request.type === 'listChatGPTTabs') {
+      try {
+        chrome.tabs.query({ url: ['https://chat.openai.com/*', 'https://chatgpt.com/*'] }, (tabs) => {
+          const list = (tabs || []).map(t => ({ id: t.id, title: t.title, active: t.active, windowId: t.windowId, url: t.url }));
+          sendResponse({ success: true, tabs: list });
+        });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+      return true;
+    }
+    if (request && request.type === 'sendToChatGPT') {
+      const isChatUrl = (url) => /https?:\/\/(chat\.openai\.com|chatgpt\.com)\//i.test(url || '');
+      const pickFallbackTab = (cb) => {
+        chrome.tabs.query({ url: ['https://chat.openai.com/*', 'https://chatgpt.com/*'] }, (tabs) => {
+          if (tabs && tabs.length) {
+            const activeTab = tabs.find(t => t.active) || tabs[0];
+            cb(activeTab);
+          } else {
+            cb(null);
+          }
+        });
+      };
+  
+      const proceed = (targetTab) => {
+        if (!targetTab) {
+          sendResponse({ success: false, error: '未找到 ChatGPT 标签页' });
+          return;
+        }
+        const tabId = targetTab.id;
+
+        const payload = {
+          type: 'composeInChatGPT',
+          imageDataUrl: request.imageDataUrl || null,
+          text: request.text || ''
+        };
+
+        const sendCompose = () => {
+          try {
+            chrome.tabs.sendMessage(tabId, payload, (resp) => {
+              if (chrome.runtime.lastError) {
+                console.warn('sendMessage 失败，尝试注入内容脚本后重试：', chrome.runtime.lastError.message);
+                // 注入内容脚本并重试
+                chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }, () => {
+                  if (chrome.runtime.lastError) {
+                    sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                    return;
+                  }
+                  setTimeout(() => {
+                    try {
+                      chrome.tabs.sendMessage(tabId, payload, (resp2) => {
+                        if (chrome.runtime.lastError) {
+                          sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                          return;
+                        }
+                        sendResponse(resp2 || { success: true });
+                      });
+                    } catch (e) {
+                      sendResponse({ success: false, error: e.message });
+                    }
+                  }, 250);
+                });
+              } else {
+                sendResponse(resp || { success: true });
+              }
+            });
+          } catch (e) {
+            sendResponse({ success: false, error: e.message });
+          }
+        };
+
+        // 激活并发送（适当延时，确保页面与内容脚本可用）
+        chrome.tabs.update(tabId, { active: true }, () => {
+          setTimeout(sendCompose, 600);
+        });
+      };
+  
+      try {
+        if (request.targetTabId) {
+          chrome.tabs.get(Number(request.targetTabId), (tab) => {
+            if (chrome.runtime.lastError || !tab) {
+              pickFallbackTab(proceed);
+            } else {
+              proceed(tab);
+            }
+          });
+        } else {
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            const active = (tabs && tabs[0]) || null;
+            if (active && isChatUrl(active.url)) {
+              proceed(active);
+            } else {
+              pickFallbackTab(proceed);
+            }
+          });
+        }
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+      return true; // async
+    }
     return true;
 });
 
