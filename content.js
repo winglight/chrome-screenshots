@@ -298,7 +298,6 @@ let settings = {
   hotkey: 'Ctrl+Shift+S',
   texts: [''],
   targetChatGPTTabId: null,
-  autoEnterSend: false,
 };
 let hotkeyListenerAttached = false;
 let currentHotkey = null;
@@ -367,7 +366,7 @@ function applyHotkeyListener() {
 
 function loadSettings(callback) {
   chrome.storage.local.get(['settings'], (res) => {
-    const defaults = { screenshotArea: 'full', selector: '', hotkey: 'Ctrl+Shift+S', texts: [''], targetChatGPTTabId: null, autoEnterSend: false };
+    const defaults = { screenshotArea: 'full', selector: '', hotkey: 'Ctrl+Shift+S', texts: [''], targetChatGPTTabId: null };
     settings = Object.assign({}, defaults, res.settings || {});
     applyHotkeyListener();
     if (typeof callback === 'function') callback(settings);
@@ -545,45 +544,17 @@ async function fillTextAndSend(text) {
   // 等待 UI 处理输入
   await new Promise(r => setTimeout(r, 250));
 
-  // 如果用户偏好“自动按回车发送”，优先回车
+  // 取消任何自动发送逻辑，仅填入文本
   const target = textarea || editable;
-  if (settings && settings.autoEnterSend && target) {
-    const evt = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
-    target.dispatchEvent(evt);
-    return;
-  }
-
-  // 查找发送按钮并点击；若找不到或按钮禁用则回车
-  const findSendBtn = () => {
-    const btn = document.querySelector('button[data-testid="send-button"], form button[type="submit"], button[aria-label*="Send" i], button[aria-label*="发送" i]');
-    if (!btn) return null;
-    const ariaDisabled = btn.getAttribute('aria-disabled');
-    const disabled = btn.disabled || ariaDisabled === 'true' || btn.getAttribute('data-state') === 'disabled';
-    return (isVisible(btn) ? btn : null) && !disabled ? btn : btn; // 返回按钮本身，后续再判断可用性
-  };
-  let sendBtn = findSendBtn();
-  if (!sendBtn) {
-    sendBtn = await waitFor(() => findSendBtn(), 3000, 150);
-  }
-
-  // 如果按钮存在但当前不可用，则等待其变为可用
-  if (sendBtn) {
-    const enabled = await waitFor(() => {
-      const btn = findSendBtn();
-      if (!btn) return null;
-      const ariaDisabled = btn.getAttribute('aria-disabled');
-      const disabled = btn.disabled || ariaDisabled === 'true' || btn.getAttribute('data-state') === 'disabled';
-      return !disabled && isVisible(btn) ? btn : null;
-    }, 5000, 150);
-    if (enabled) sendBtn = enabled;
-  }
-
-  if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
-    sendBtn.click();
-  } else {
-    const evt = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
-    target?.dispatchEvent(evt);
-  }
+  console.debug('[chrome-screenshots] auto send disabled -> text filled only');
+  try {
+    target?.focus();
+    if (textarea) {
+      const len = (textarea.value || '').length;
+      textarea.selectionStart = textarea.selectionEnd = len;
+    }
+  } catch {}
+  return;
 }
 
 function showTextSelectionModal(texts) {
@@ -663,12 +634,6 @@ function injectSidebar() {
         <div class="form-group">
           <label>ChatGPT 标签页</label>
           <select id="chatgpt-tabs-select"></select>
-        </div>
-        <div class="form-group">
-          <label>
-            <input type="checkbox" id="cfg-auto-enter" /> 自动按回车发送消息（默认关闭）
-          </label>
-          <div style="font-size:12px;color:#666;margin-top:6px">开启后将优先通过回车键触发发送；关闭时优先点击发送按钮</div>
         </div>
         <div class="form-group">
           <button id="cfg-save-settings" style="width:100%;background:#16a34a">保存</button>
@@ -752,7 +717,6 @@ function initializeSettingsPanel() {
   const refreshTabsBtn = sidebar.querySelector('#refresh-chatgpt-tabs-btn');
   const closeBtn = sidebar.querySelector('#close-sidebar-btn');
   const saveBtn = sidebar.querySelector('#cfg-save-settings');
-  const autoEnterCheckbox = sidebar.querySelector('#cfg-auto-enter');
 
   let draft = null; // 草稿设置，点击保存时一次性提交
   let dragIndex = null;
@@ -916,9 +880,6 @@ function initializeSettingsPanel() {
     draft.targetChatGPTTabId = val ? Number(val) : null;
   });
 
-  autoEnterCheckbox.addEventListener('change', () => {
-    draft.autoEnterSend = !!autoEnterCheckbox.checked;
-  });
 
   // 保存按钮：一次性保存草稿
   saveBtn.addEventListener('click', () => {
@@ -927,7 +888,6 @@ function initializeSettingsPanel() {
     draft.selector = selectorInput.value;
     draft.screenshotArea = areaSel.value;
     draft.targetChatGPTTabId = tabsSelect.value ? Number(tabsSelect.value) : null;
-    draft.autoEnterSend = !!autoEnterCheckbox.checked;
     saveSettings(draft, () => {
       console.log('设置已保存');
     });
@@ -942,7 +902,6 @@ function initializeSettingsPanel() {
     hotkeyInput.value = formatHotkeyForDisplay((draft.hotkey || 'Ctrl+Shift+S').replace(/\s+/g, '').toLowerCase());
     renderTexts(Array.isArray(draft.texts) ? draft.texts : ['']);
     refreshChatGPTTabs(draft.targetChatGPTTabId != null ? String(draft.targetChatGPTTabId) : '');
-    autoEnterCheckbox.checked = !!draft.autoEnterSend;
   });
 }
 
