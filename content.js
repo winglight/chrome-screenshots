@@ -296,11 +296,13 @@ let settings = {
   screenshotArea: 'full',
   selector: '',
   hotkey: 'Ctrl+Shift+S',
+  quickHotkey: 'Ctrl+Shift+Q',
   texts: [''],
   targetChatGPTTabId: null,
+  lastUsedText: '',
 };
 let hotkeyListenerAttached = false;
-let currentHotkey = null;
+const currentHotkeys = { capture: null, quickSend: null };
 
 // 等待工具：轮询直到 predicate 返回非空或超时
 async function waitFor(predicate, timeout = 4000, interval = 150) {
@@ -346,18 +348,23 @@ function eventToHotkey(e) {
 }
 
 function applyHotkeyListener() {
-  const wanted = normalizeHotkey(settings.hotkey);
-  currentHotkey = wanted;
+  currentHotkeys.capture = normalizeHotkey(settings.hotkey);
+  currentHotkeys.quickSend = normalizeHotkey(settings.quickHotkey);
   if (hotkeyListenerAttached) return;
   window.addEventListener('keydown', async (e) => {
     try {
       if (!isTradingViewChartUrl()) return;
       const pressed = eventToHotkey(e);
-      if (pressed === currentHotkey) {
+      if (pressed && currentHotkeys.capture && pressed === currentHotkeys.capture) {
         e.preventDefault();
         e.stopPropagation();
         console.debug('[chrome-screenshots] Hotkey matched, starting capture flow');
         await startCaptureFlow();
+      } else if (pressed && currentHotkeys.quickSend && pressed === currentHotkeys.quickSend) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.debug('[chrome-screenshots] Quick send hotkey matched, sending with last text');
+        await startQuickSendFlow();
       }
     } catch {}
   }, true);
@@ -366,7 +373,15 @@ function applyHotkeyListener() {
 
 function loadSettings(callback) {
   chrome.storage.local.get(['settings'], (res) => {
-    const defaults = { screenshotArea: 'full', selector: '', hotkey: 'Ctrl+Shift+S', texts: [''], targetChatGPTTabId: null };
+    const defaults = {
+      screenshotArea: 'full',
+      selector: '',
+      hotkey: 'Ctrl+Shift+S',
+      quickHotkey: 'Ctrl+Shift+Q',
+      texts: [''],
+      targetChatGPTTabId: null,
+      lastUsedText: '',
+    };
     settings = Object.assign({}, defaults, res.settings || {});
     applyHotkeyListener();
     if (typeof callback === 'function') callback(settings);
@@ -381,6 +396,18 @@ function saveSettings(newSettings, callback) {
   });
 }
 
+function beginScreenshotCapture(element) {
+  return (async () => {
+    try {
+      const screenshotBlob = await captureElement(element);
+      return await blobToBase64(screenshotBlob);
+    } catch (e) {
+      console.error('截图失败（将仅发送文本）:', e);
+      return null;
+    }
+  })();
+}
+
 async function startCaptureFlow() {
   try {
     const element = settings.screenshotArea === 'full' ? document.documentElement : document.querySelector(settings.selector);
@@ -390,15 +417,7 @@ async function startCaptureFlow() {
     }
 
     // 先触发截图，让后台尽快完成可见区域快照；随后稍作延迟再显示对话框，避免弹框被截入
-    const capturePromise = (async () => {
-      try {
-        const screenshotBlob = await captureElement(element);
-        return await blobToBase64(screenshotBlob);
-      } catch (e) {
-        console.error('截图失败（将仅发送文本）:', e);
-        return null;
-      }
-    })();
+    const capturePromise = beginScreenshotCapture(element);
 
     // 给截图一个微小的时间窗口，尽量在对话框出现前完成屏幕快照
     await new Promise(r => setTimeout(r, 160));
@@ -409,27 +428,79 @@ async function startCaptureFlow() {
 
     // 追加保存新输入的文本（去重）
     const trimmed = String(chosenText || '').trim();
-    if (trimmed) {
-      const arr = Array.isArray(settings.texts) ? settings.texts.slice() : [];
-      if (!arr.includes(trimmed)) {
-        arr.push(trimmed);
-        saveSettings({ texts: arr });
-      }
-    }
-
     const dataUrl = await capturePromise; // 若截图失败则为 null
 
-    const resp = await sendMessageSafe({
-      type: 'sendToChatGPT',
-      imageDataUrl: dataUrl || null,
-      text: trimmed,
-      targetTabId: settings.targetChatGPTTabId || null,
-    });
-    if (!resp || !resp.success) {
+    let resp;
+    try {
+      resp = await sendMessageSafe({
+        type: 'sendToChatGPT',
+        imageDataUrl: dataUrl || null,
+        text: trimmed,
+        targetTabId: settings.targetChatGPTTabId || null,
+      });
+    } catch (e) {
+      console.error('发送到 ChatGPT 失败:', e);
+    }
+    if (resp && !resp.success) {
       console.error('发送到 ChatGPT 失败:', resp?.error);
     }
+
+    const existingTexts = Array.isArray(settings.texts) ? settings.texts.slice() : [];
+    const updates = { lastUsedText: trimmed };
+    if (trimmed && !existingTexts.includes(trimmed)) {
+      updates.texts = existingTexts.concat(trimmed);
+    }
+    saveSettings(updates);
   } catch (err) {
     console.error('自动截图流程失败:', err);
+  }
+}
+
+async function startQuickSendFlow() {
+  try {
+    const element = settings.screenshotArea === 'full' ? document.documentElement : document.querySelector(settings.selector);
+    if (!element) {
+      console.error('未找到选择的元素用于截图:', settings.selector);
+      return;
+    }
+
+    const capturePromise = beginScreenshotCapture(element);
+    await new Promise(r => setTimeout(r, 160));
+
+    let candidate = typeof settings.lastUsedText === 'string' ? settings.lastUsedText : '';
+    if (!candidate) {
+      const arr = Array.isArray(settings.texts) ? settings.texts : [];
+      if (arr.length) {
+        candidate = arr[arr.length - 1] || '';
+      }
+    }
+    const textToSend = String(candidate || '').trim();
+
+    const dataUrl = await capturePromise;
+
+    let resp;
+    try {
+      resp = await sendMessageSafe({
+        type: 'sendToChatGPT',
+        imageDataUrl: dataUrl || null,
+        text: textToSend,
+        targetTabId: settings.targetChatGPTTabId || null,
+      });
+    } catch (e) {
+      console.error('发送到 ChatGPT 失败:', e);
+    }
+    if (resp && !resp.success) {
+      console.error('发送到 ChatGPT 失败:', resp?.error);
+    }
+
+    const existingTexts = Array.isArray(settings.texts) ? settings.texts.slice() : [];
+    const updates = { lastUsedText: textToSend };
+    if (textToSend && !existingTexts.includes(textToSend)) {
+      updates.texts = existingTexts.concat(textToSend);
+    }
+    saveSettings(updates);
+  } catch (err) {
+    console.error('快速发送流程失败:', err);
   }
 }
 
@@ -627,6 +698,11 @@ function injectSidebar() {
           <div style="font-size:12px;color:#666;margin-top:6px">在输入框中按下你想要的组合键；示例：Ctrl+Shift+S</div>
         </div>
         <div class="form-group">
+          <label>快速发送快捷键</label>
+          <input type="text" id="cfg-quick-hotkey" placeholder="Ctrl+Shift+Q" />
+          <div style="font-size:12px;color:#666;margin-top:6px">按下后会使用最近一次发送的文本直接发送</div>
+        </div>
+        <div class="form-group">
           <label>预设文本</label>
           <div id="cfg-texts-container" style="display:flex;flex-direction:column;gap:8px"></div>
           <button id="cfg-add-text" style="margin-top:8px">新增一条文本</button>
@@ -711,6 +787,7 @@ function initializeSettingsPanel() {
   const areaSel = sidebar.querySelector('#cfg-screenshot-area');
   const selectorInput = sidebar.querySelector('#cfg-selector');
   const hotkeyInput = sidebar.querySelector('#cfg-hotkey');
+  const quickHotkeyInput = sidebar.querySelector('#cfg-quick-hotkey');
   const textsContainer = sidebar.querySelector('#cfg-texts-container');
   const addTextBtn = sidebar.querySelector('#cfg-add-text');
   const tabsSelect = sidebar.querySelector('#chatgpt-tabs-select');
@@ -871,6 +948,21 @@ function initializeSettingsPanel() {
     draft.hotkey = display;
   }, true);
 
+  quickHotkeyInput.addEventListener('keydown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const parts = [];
+    if (e.ctrlKey) parts.push('Ctrl');
+    if (e.metaKey) parts.push('Meta');
+    if (e.shiftKey) parts.push('Shift');
+    if (e.altKey) parts.push('Alt');
+    const key = e.key && e.key.length === 1 ? e.key.toUpperCase() : (e.key || '').toUpperCase();
+    if (key && !['CONTROL','META','SHIFT','ALT'].includes(key)) parts.push(key);
+    const display = parts.join('+') || 'Ctrl+Shift+Q';
+    quickHotkeyInput.value = display;
+    draft.quickHotkey = display;
+  }, true);
+
   refreshTabsBtn.addEventListener('click', () => {
     refreshChatGPTTabs(tabsSelect.value || '');
   });
@@ -900,6 +992,7 @@ function initializeSettingsPanel() {
     selectorInput.style.display = areaSel.value === 'selector' ? 'block' : 'none';
     selectorInput.value = draft.selector || '';
     hotkeyInput.value = formatHotkeyForDisplay((draft.hotkey || 'Ctrl+Shift+S').replace(/\s+/g, '').toLowerCase());
+    quickHotkeyInput.value = formatHotkeyForDisplay((draft.quickHotkey || 'Ctrl+Shift+Q').replace(/\s+/g, '').toLowerCase());
     renderTexts(Array.isArray(draft.texts) ? draft.texts : ['']);
     refreshChatGPTTabs(draft.targetChatGPTTabId != null ? String(draft.targetChatGPTTabId) : '');
   });
