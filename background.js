@@ -430,3 +430,32 @@ function restoreActiveTasks() {
         });
     });
 }
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request && request.type === 'postToIbbot') {
+    (async () => {
+      try {
+        const url = request.url;
+        const token = request.token || '';
+        const payload = request.payload || {};
+        if (!url) throw new Error('ibbot URL 未配置');
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+            ...(token ? { 'token': token } : {})
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        sendResponse({ success: true, data });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+  return true;
+});

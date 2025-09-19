@@ -183,12 +183,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           sendResponse({ success: false, error: 'Not ChatGPT domain' });
           return;
         }
+        // 确保已加载设置
+        if (!settings || typeof settings !== 'object') {
+          await new Promise(resolve => loadSettings(resolve));
+        }
         if (request.imageDataUrl) {
           await attachImageToChatGPT(request.imageDataUrl);
-          await new Promise(r => setTimeout(r, 900));
+          // 等待上传完成（以发送按钮可点击作为完成信号）
+          await waitForSendButtonEnabled(settings.sendButtonWaitTimeoutMs || 60000);
         }
         if (typeof request.text === 'string') {
           await fillTextAndSend(request.text);
+        }
+        // 如果设置开启，则自动发送并等待回复（仅保留首次发送与等待）
+        if (request.imageDataUrl && settings.autoSendAfterUpload) {
+          const sent = await clickSendButtonWhenEnabled(settings.sendButtonWaitTimeoutMs || 60000);
+          if (!sent) throw new Error('发送按钮不可用');
+          const replyText = await waitForAssistantResponseDone(
+            settings.replyWaitTimeoutMs || 120000,
+            settings.replyStableCycles || 6,
+            settings.replyPollIntervalMs || 500
+          );
+          // 根据你的要求：不再进行二次提示与 JSON 提取，也不再上报 ibbot
         }
         sendResponse({ success: true });
       } catch (e) {
@@ -298,6 +314,13 @@ let settings = {
   hotkey: 'Ctrl+Shift+S',
   texts: [''],
   targetChatGPTTabId: null,
+  autoSendAfterUpload: false,
+  ibbotUrl: '',
+  ibbotToken: '',
+  replyWaitTimeoutMs: 120000,
+  replyStableCycles: 6,
+  replyPollIntervalMs: 500,
+  sendButtonWaitTimeoutMs: 60000
 };
 let hotkeyListenerAttached = false;
 let currentHotkey = null;
@@ -366,7 +389,20 @@ function applyHotkeyListener() {
 
 function loadSettings(callback) {
   chrome.storage.local.get(['settings'], (res) => {
-    const defaults = { screenshotArea: 'full', selector: '', hotkey: 'Ctrl+Shift+S', texts: [''], targetChatGPTTabId: null };
+    const defaults = {
+      screenshotArea: 'full',
+      selector: '',
+      hotkey: 'Ctrl+Shift+S',
+      texts: [''],
+      targetChatGPTTabId: null,
+      autoSendAfterUpload: false,
+      ibbotUrl: '',
+      ibbotToken: '',
+      replyWaitTimeoutMs: 120000,
+      replyStableCycles: 6,
+      replyPollIntervalMs: 500,
+      sendButtonWaitTimeoutMs: 60000
+    };
     settings = Object.assign({}, defaults, res.settings || {});
     applyHotkeyListener();
     if (typeof callback === 'function') callback(settings);
@@ -546,7 +582,7 @@ async function fillTextAndSend(text) {
 
   // 取消任何自动发送逻辑，仅填入文本
   const target = textarea || editable;
-  console.debug('[chrome-screenshots] auto send disabled -> text filled only');
+  console.debug('[chrome-screenshots] text filled');
   try {
     target?.focus();
     if (textarea) {
@@ -636,6 +672,38 @@ function injectSidebar() {
           <select id="chatgpt-tabs-select"></select>
         </div>
         <div class="form-group">
+          <label><input type="checkbox" id="cfg-auto-send-after-upload" /> 图片上传完成后自动发送消息</label>
+        </div>
+        <div class="form-group">
+          <label>等待回复完成参数</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            <div>
+              <div style="font-size:12px;color:#666;margin-bottom:4px">超时(ms)</div>
+              <input type="number" id="cfg-reply-timeout-ms" placeholder="120000" />
+            </div>
+            <div>
+              <div style="font-size:12px;color:#666;margin-bottom:4px">稳定周期次数</div>
+              <input type="number" id="cfg-reply-stable-cycles" placeholder="6" />
+            </div>
+            <div>
+              <div style="font-size:12px;color:#666;margin-bottom:4px">轮询间隔(ms)</div>
+              <input type="number" id="cfg-reply-poll-interval-ms" placeholder="500" />
+            </div>
+            <div>
+              <div style="font-size:12px;color:#666;margin-bottom:4px">发送按钮等待超时(ms)</div>
+              <input type="number" id="cfg-send-button-timeout-ms" placeholder="60000" />
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>ibbot URL</label>
+          <input type="text" id="cfg-ibbot-url" placeholder="https://your-ibbot-endpoint" />
+        </div>
+        <div class="form-group">
+          <label>ibbot Token</label>
+          <input type="password" id="cfg-ibbot-token" placeholder="用于鉴权的 token" />
+        </div>
+        <div class="form-group">
           <button id="cfg-save-settings" style="width:100%;background:#16a34a">保存</button>
         </div>
       </div>
@@ -655,6 +723,8 @@ function injectSidebar() {
             padding: 20px;
             box-sizing: border-box;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+            overflow-y: auto; /* 允许内容滚动，避免底部表单被遮挡 */
+            -webkit-overflow-scrolling: touch; /* 移动端更顺滑的滚动 */
           }
 
           .sidebar-header {
@@ -717,6 +787,13 @@ function initializeSettingsPanel() {
   const refreshTabsBtn = sidebar.querySelector('#refresh-chatgpt-tabs-btn');
   const closeBtn = sidebar.querySelector('#close-sidebar-btn');
   const saveBtn = sidebar.querySelector('#cfg-save-settings');
+  const autoSendCheckbox = sidebar.querySelector('#cfg-auto-send-after-upload');
+  const ibbotUrlInput = sidebar.querySelector('#cfg-ibbot-url');
+  const ibbotTokenInput = sidebar.querySelector('#cfg-ibbot-token');
+  const replyTimeoutInput = sidebar.querySelector('#cfg-reply-timeout-ms');
+  const replyStableCyclesInput = sidebar.querySelector('#cfg-reply-stable-cycles');
+  const replyPollIntervalInput = sidebar.querySelector('#cfg-reply-poll-interval-ms');
+  const sendBtnTimeoutInput = sidebar.querySelector('#cfg-send-button-timeout-ms');
 
   let draft = null; // 草稿设置，点击保存时一次性提交
   let dragIndex = null;
@@ -801,6 +878,28 @@ function initializeSettingsPanel() {
     const next = collectTexts().concat('');
     draft.texts = next;
     renderTexts(draft.texts);
+  });
+
+  autoSendCheckbox.addEventListener('change', () => {
+    draft.autoSendAfterUpload = !!autoSendCheckbox.checked;
+  });
+  ibbotUrlInput.addEventListener('input', () => {
+    draft.ibbotUrl = ibbotUrlInput.value || '';
+  });
+  ibbotTokenInput.addEventListener('input', () => {
+    draft.ibbotToken = ibbotTokenInput.value || '';
+  });
+  replyTimeoutInput.addEventListener('input', () => {
+    draft.replyWaitTimeoutMs = Number(replyTimeoutInput.value || 0) || 120000;
+  });
+  replyStableCyclesInput.addEventListener('input', () => {
+    draft.replyStableCycles = Math.max(1, Number(replyStableCyclesInput.value || 0) || 6);
+  });
+  replyPollIntervalInput.addEventListener('input', () => {
+    draft.replyPollIntervalMs = Math.max(50, Number(replyPollIntervalInput.value || 0) || 500);
+  });
+  sendBtnTimeoutInput.addEventListener('input', () => {
+    draft.sendButtonWaitTimeoutMs = Number(sendBtnTimeoutInput.value || 0) || 60000;
   });
 
   // 文本输入变更（不立刻保存，只更新草稿）
@@ -902,6 +1001,13 @@ function initializeSettingsPanel() {
     hotkeyInput.value = formatHotkeyForDisplay((draft.hotkey || 'Ctrl+Shift+S').replace(/\s+/g, '').toLowerCase());
     renderTexts(Array.isArray(draft.texts) ? draft.texts : ['']);
     refreshChatGPTTabs(draft.targetChatGPTTabId != null ? String(draft.targetChatGPTTabId) : '');
+    autoSendCheckbox.checked = !!draft.autoSendAfterUpload;
+    ibbotUrlInput.value = draft.ibbotUrl || '';
+    ibbotTokenInput.value = draft.ibbotToken || '';
+    replyTimeoutInput.value = String(draft.replyWaitTimeoutMs || 120000);
+    replyStableCyclesInput.value = String(draft.replyStableCycles || 6);
+    replyPollIntervalInput.value = String(draft.replyPollIntervalMs || 500);
+    sendBtnTimeoutInput.value = String(draft.sendButtonWaitTimeoutMs || 60000);
   });
 }
 
@@ -949,4 +1055,138 @@ function sendMessageSafe(payload, retries = 3, delay = 600) {
     };
     attempt(retries);
   });
+}
+
+// 新增：等待发送按钮可用、点击发送、等待助手回复完成、发送提示词并等待
+function getSendButtonElement() {
+  const selectors = [
+    'button[data-testid="send-button"]',
+    'button[aria-label*="send" i]',
+    'button[aria-label*="发送" i]',
+    'form button[type="submit"]'
+  ];
+  for (const sel of selectors) {
+    const btn = document.querySelector(sel);
+    if (btn && isVisible(btn)) return btn;
+  }
+  return null;
+}
+
+async function waitForSendButtonEnabled(timeout = 60000) {
+  const btn = await waitFor(() => {
+    const b = getSendButtonElement();
+    return b && !b.disabled ? b : null;
+  }, timeout, 200);
+  return !!btn;
+}
+
+async function clickSendButtonWhenEnabled(timeout = 60000) {
+  const ok = await waitForSendButtonEnabled(timeout);
+  if (!ok) return false;
+  const btn = getSendButtonElement();
+  if (!btn) return false;
+  btn.click();
+  return true;
+}
+
+function getLastAssistantMessageEl() {
+  const candidates = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], div[data-testid="conversation-turn"]'));
+  const last = candidates.length ? candidates[candidates.length - 1] : null;
+  return last || null;
+}
+
+function getLastAssistantText() {
+  const el = getLastAssistantMessageEl();
+  if (!el) return '';
+  // 常见内容容器
+  const textEl = el.querySelector('.markdown, [data-message-author-role="assistant"], .prose, article, div');
+  return (textEl ? textEl.innerText : el.innerText) || '';
+}
+
+function isGenerating() {
+  // 存在“停止生成/Stop generating”按钮时，通常表示仍在生成
+  const stopBtn = document.querySelector('button[aria-label*="stop" i], button[aria-label*="停止" i]');
+  return !!(stopBtn && isVisible(stopBtn));
+}
+
+async function waitForAssistantResponseDone(timeout = 120000, stableCycles = 6, pollInterval = 500) {
+  const end = Date.now() + timeout;
+  let last = getLastAssistantText();
+  let stable = 0;
+  while (Date.now() < end) {
+    await new Promise(r => setTimeout(r, pollInterval));
+    const cur = getLastAssistantText();
+    if (cur && cur === last && !isGenerating()) {
+      stable++;
+      if (stable >= stableCycles) return cur;
+    } else {
+      stable = 0;
+      last = cur;
+    }
+  }
+  return last || '';
+}
+
+async function sendPromptAndWait(promptText) {
+  await fillTextAndSend(promptText);
+  const clicked = await clickSendButtonWhenEnabled(settings.sendButtonWaitTimeoutMs || 60000);
+  if (!clicked) throw new Error('发送按钮不可用');
+  return await waitForAssistantResponseDone(
+    settings.replyWaitTimeoutMs || 120000,
+    settings.replyStableCycles || 6,
+    settings.replyPollIntervalMs || 500
+  );
+}
+
+function buildJsonPrompt() {
+  return (
+    '请仅返回 JSON，不要包含任何多余文字、解释或 Markdown 代码块。' +
+    '生成一个 JSON 数组（如果有多条建议，按推荐程度从高到低排序）。' +
+    '字段名称必须为英文，字段定义如下：\n' +
+    '- strategyName: 策略名称（字符串）\n' +
+    '- action: 策略动作（open/close/add）\n' +
+    '- conditions: 数组。当 action 为 open 或 add 时，每一项包含：{ direction: "long"|"short", condition: 文本, SL: 文本, TP: 文本 }；当 action 为 close 时，每一项至少包含 { condition: 文本 }\n' +
+    '- shouldTrade: 是否建议交易（布尔 true/false）。\n' +
+    '- priority: 数值型，越大表示推荐程度越高。\n' +
+    '请确保整个数组已按 priority 从高到低排序。只输出纯 JSON 数组，不要加反引号或注释。'
+  );
+}
+
+function extractJsonFromText(text) {
+  const t = String(text || '').trim();
+  // 先尝试直接解析
+  try { return JSON.parse(t); } catch {}
+  // 尝试截取第一个 JSON 数组
+  const startArr = t.indexOf('[');
+  const endArr = t.lastIndexOf(']');
+  if (startArr !== -1 && endArr !== -1 && endArr > startArr) {
+    const sub = t.slice(startArr, endArr + 1);
+    try { return JSON.parse(sub); } catch {}
+  }
+  // 退化：尝试对象
+  const startObj = t.indexOf('{');
+  const endObj = t.lastIndexOf('}');
+  if (startObj !== -1 && endObj !== -1 && endObj > startObj) {
+    const sub2 = t.slice(startObj, endObj + 1);
+    try { return JSON.parse(sub2); } catch {}
+  }
+  console.warn('未能从文本中提取有效 JSON');
+  return null;
+}
+
+function normalizeStrategyJson(data) {
+  try {
+    if (!data) return null;
+    let arr = Array.isArray(data) ? data : [data];
+    arr = arr.filter(Boolean).map((item) => {
+      const it = (item && typeof item === 'object') ? item : {};
+      let p = Number(it.priority);
+      if (!Number.isFinite(p)) p = 0;
+      return Object.assign({}, it, { priority: p });
+    });
+    arr.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
+    return arr;
+  } catch {
+    return null;
+  }
 }
