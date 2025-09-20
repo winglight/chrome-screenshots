@@ -237,6 +237,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
       return true;
     }
+    if (request && request.type === 'listGoogleAITabs') {
+      try {
+        chrome.tabs.query({ url: ['https://aistudio.google.com/prompts*'] }, (tabs) => {
+          const list = (tabs || []).map(t => ({ id: t.id, title: t.title, active: t.active, windowId: t.windowId, url: t.url }));
+          sendResponse({ success: true, tabs: list });
+        });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+      return true;
+    }
     if (request && request.type === 'sendToChatGPT') {
       const isChatUrl = (url) => /https?:\/\/(chat\.openai\.com|chatgpt\.com)\//i.test(url || '');
       const pickFallbackTab = (cb) => {
@@ -316,6 +327,94 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
             const active = (tabs && tabs[0]) || null;
             if (active && isChatUrl(active.url)) {
+              proceed(active);
+            } else {
+              pickFallbackTab(proceed);
+            }
+          });
+        }
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+      return true; // async
+    }
+    if (request && request.type === 'sendToGoogleAI') {
+      const isGoogleUrl = (url) => /https?:\/\/aistudio\.google\.com\/prompts/i.test(url || '');
+      const pickFallbackTab = (cb) => {
+        chrome.tabs.query({ url: ['https://aistudio.google.com/prompts*'] }, (tabs) => {
+          if (tabs && tabs.length) {
+            const activeTab = tabs.find(t => t.active) || tabs[0];
+            cb(activeTab);
+          } else {
+            cb(null);
+          }
+        });
+      };
+
+      const proceed = (targetTab) => {
+        if (!targetTab) {
+          sendResponse({ success: false, error: '未找到 Google AI Studio 标签页' });
+          return;
+        }
+        const tabId = targetTab.id;
+
+        const payload = {
+          type: 'composeInGoogleAI',
+          imageDataUrl: request.imageDataUrl || null,
+          text: request.text || ''
+        };
+
+        const sendCompose = () => {
+          try {
+            chrome.tabs.sendMessage(tabId, payload, (resp) => {
+              if (chrome.runtime.lastError) {
+                console.warn('sendMessage 失败，尝试注入内容脚本后重试：', chrome.runtime.lastError.message);
+                chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }, () => {
+                  if (chrome.runtime.lastError) {
+                    sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                    return;
+                  }
+                  setTimeout(() => {
+                    try {
+                      chrome.tabs.sendMessage(tabId, payload, (resp2) => {
+                        if (chrome.runtime.lastError) {
+                          sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                          return;
+                        }
+                        sendResponse(resp2 || { success: true });
+                      });
+                    } catch (e) {
+                      sendResponse({ success: false, error: e.message });
+                    }
+                  }, 250);
+                });
+              } else {
+                sendResponse(resp || { success: true });
+              }
+            });
+          } catch (e) {
+            sendResponse({ success: false, error: e.message });
+          }
+        };
+
+        chrome.tabs.update(tabId, { active: true }, () => {
+          setTimeout(sendCompose, 600);
+        });
+      };
+
+      try {
+        if (request.targetTabId) {
+          chrome.tabs.get(Number(request.targetTabId), (tab) => {
+            if (chrome.runtime.lastError || !tab) {
+              pickFallbackTab(proceed);
+            } else {
+              proceed(tab);
+            }
+          });
+        } else {
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            const active = (tabs && tabs[0]) || null;
+            if (active && isGoogleUrl(active.url)) {
               proceed(active);
             } else {
               pickFallbackTab(proceed);

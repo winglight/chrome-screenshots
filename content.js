@@ -179,6 +179,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'composeInChatGPT') {
     (async () => {
       try {
+        activeComposePlatform = 'chatgpt';
         if (!/chat\.openai\.com$|chatgpt\.com$/i.test(location.hostname)) {
           sendResponse({ success: false, error: 'Not ChatGPT domain' });
           return;
@@ -188,7 +189,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           await new Promise(resolve => loadSettings(resolve));
         }
         if (request.imageDataUrl) {
-          await attachImageToChatGPT(request.imageDataUrl);
+          await attachImageToAssistant(request.imageDataUrl, 'chatgpt');
           // 等待上传完成（以发送按钮可点击作为完成信号）
           await waitForSendButtonEnabled(settings.sendButtonWaitTimeoutMs || 60000);
         }
@@ -209,6 +210,43 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: true });
       } catch (e) {
         console.error('composeInChatGPT error:', e);
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+  if (request.type === 'composeInGoogleAI') {
+    (async () => {
+      try {
+        activeComposePlatform = 'google';
+        const hostOk = /aistudio\.google\.com$/i.test(location.hostname);
+        const pathOk = /^\/prompts/i.test(location.pathname || '');
+        if (!hostOk || !pathOk) {
+          sendResponse({ success: false, error: 'Not Google AI Studio domain' });
+          return;
+        }
+        if (!settings || typeof settings !== 'object') {
+          await new Promise(resolve => loadSettings(resolve));
+        }
+        if (request.imageDataUrl) {
+          await attachImageToAssistant(request.imageDataUrl, 'google');
+          await waitForSendButtonEnabled(settings.sendButtonWaitTimeoutMs || 60000);
+        }
+        if (typeof request.text === 'string') {
+          await fillTextAndSend(request.text);
+        }
+        if (request.imageDataUrl && settings.autoSendAfterUpload) {
+          const sent = await clickSendButtonWhenEnabled(settings.sendButtonWaitTimeoutMs || 60000);
+          if (!sent) throw new Error('发送按钮不可用');
+          const replyText = await waitForAssistantResponseDone(
+            settings.replyWaitTimeoutMs || 120000,
+            settings.replyStableCycles || 6,
+            settings.replyPollIntervalMs || 500
+          );
+        }
+        sendResponse({ success: true });
+      } catch (e) {
+        console.error('composeInGoogleAI error:', e);
         sendResponse({ success: false, error: e.message });
       }
     })();
@@ -308,17 +346,79 @@ function blobToBase64(blob) {
 }
 
 // 新增：全局设置与快捷键（顶层）
+const AI_PLATFORM_META = {
+  chatgpt: {
+    key: 'chatgpt',
+    label: 'ChatGPT',
+    listMessageType: 'listChatGPTTabs',
+    sendMessageType: 'sendToChatGPT',
+  },
+  google: {
+    key: 'google',
+    label: 'Google AI Studio',
+    listMessageType: 'listGoogleAITabs',
+    sendMessageType: 'sendToGoogleAI',
+  },
+};
+
+let activeComposePlatform = 'chatgpt';
+
 let settings = {
   screenshotArea: 'full',
   selector: '',
   hotkey: 'Ctrl+Shift+S',
   quickHotkey: 'Ctrl+Shift+Q',
   texts: [''],
+  targetPlatform: 'chatgpt',
   targetChatGPTTabId: null,
+  targetGoogleAITabId: null,
   lastUsedText: '',
 };
 let hotkeyListenerAttached = false;
 const currentHotkeys = { capture: null, quickSend: null };
+
+function normalizePlatform(value) {
+  return value === 'google' ? 'google' : 'chatgpt';
+}
+
+function getPlatformMeta(value) {
+  return AI_PLATFORM_META[normalizePlatform(value)] || AI_PLATFORM_META.chatgpt;
+}
+
+function getPlatformLabel(value) {
+  return getPlatformMeta(value).label;
+}
+
+function getPlatformTabIdFrom(container, platform) {
+  const normalized = normalizePlatform(platform);
+  const source = container || {};
+  if (normalized === 'google') {
+    return source.targetGoogleAITabId != null ? source.targetGoogleAITabId : null;
+  }
+  return source.targetChatGPTTabId != null ? source.targetChatGPTTabId : null;
+}
+
+function setPlatformTabIdFor(container, platform, val) {
+  if (!container) return;
+  const normalized = normalizePlatform(platform);
+  let parsed = null;
+  if (val !== '' && val !== null && val !== undefined) {
+    const num = Number(val);
+    parsed = Number.isFinite(num) ? num : null;
+  }
+  if (normalized === 'google') {
+    container.targetGoogleAITabId = parsed;
+  } else {
+    container.targetChatGPTTabId = parsed;
+  }
+}
+
+function getCurrentTargetConfig() {
+  const platform = normalizePlatform(settings.targetPlatform);
+  const tabId = getPlatformTabIdFrom(settings, platform);
+  const meta = getPlatformMeta(platform);
+  return { platform, tabId, meta };
+}
 
 // 等待工具：轮询直到 predicate 返回非空或超时
 async function waitFor(predicate, timeout = 4000, interval = 150) {
@@ -395,7 +495,9 @@ function loadSettings(callback) {
       hotkey: 'Ctrl+Shift+S',
       quickHotkey: 'Ctrl+Shift+Q',
       texts: [''],
+      targetPlatform: 'chatgpt',
       targetChatGPTTabId: null,
+      targetGoogleAITabId: null,
       lastUsedText: '',
     };
     settings = Object.assign({}, defaults, res.settings || {});
@@ -424,6 +526,26 @@ function beginScreenshotCapture(element) {
   })();
 }
 
+async function sendToActiveAssistant(imageDataUrl, text) {
+  const { meta, tabId } = getCurrentTargetConfig();
+  let resp = null;
+  try {
+    resp = await sendMessageSafe({
+      type: meta.sendMessageType,
+      imageDataUrl: imageDataUrl || null,
+      text: text != null ? String(text) : '',
+      targetTabId: tabId != null ? tabId : null,
+    });
+  } catch (e) {
+    console.error(`发送到 ${meta.label} 失败:`, e);
+    return null;
+  }
+  if (resp && !resp.success) {
+    console.error(`发送到 ${meta.label} 失败:`, resp?.error);
+  }
+  return resp;
+}
+
 async function startCaptureFlow() {
   try {
     const element = settings.screenshotArea === 'full' ? document.documentElement : document.querySelector(settings.selector);
@@ -446,20 +568,7 @@ async function startCaptureFlow() {
     const trimmed = String(chosenText || '').trim();
     const dataUrl = await capturePromise; // 若截图失败则为 null
 
-    let resp;
-    try {
-      resp = await sendMessageSafe({
-        type: 'sendToChatGPT',
-        imageDataUrl: dataUrl || null,
-        text: trimmed,
-        targetTabId: settings.targetChatGPTTabId || null,
-      });
-    } catch (e) {
-      console.error('发送到 ChatGPT 失败:', e);
-    }
-    if (resp && !resp.success) {
-      console.error('发送到 ChatGPT 失败:', resp?.error);
-    }
+    await sendToActiveAssistant(dataUrl || null, trimmed);
 
     const existingTexts = Array.isArray(settings.texts) ? settings.texts.slice() : [];
     const updates = { lastUsedText: trimmed };
@@ -494,20 +603,7 @@ async function startQuickSendFlow() {
 
     const dataUrl = await capturePromise;
 
-    let resp;
-    try {
-      resp = await sendMessageSafe({
-        type: 'sendToChatGPT',
-        imageDataUrl: dataUrl || null,
-        text: textToSend,
-        targetTabId: settings.targetChatGPTTabId || null,
-      });
-    } catch (e) {
-      console.error('发送到 ChatGPT 失败:', e);
-    }
-    if (resp && !resp.success) {
-      console.error('发送到 ChatGPT 失败:', resp?.error);
-    }
+    await sendToActiveAssistant(dataUrl || null, textToSend);
 
     const existingTexts = Array.isArray(settings.texts) ? settings.texts.slice() : [];
     const updates = { lastUsedText: textToSend };
@@ -520,22 +616,56 @@ async function startQuickSendFlow() {
   }
 }
 
-async function attachImageToChatGPT(dataUrl) {
+async function attachImageToAssistant(dataUrl, platform = 'chatgpt') {
+  const normalized = normalizePlatform(platform);
   const resp = await fetch(dataUrl);
   const blob = await resp.blob();
   const file = new File([blob], 'screenshot.png', { type: blob.type || 'image/png' });
   const dt = new DataTransfer();
   dt.items.add(file);
 
-  const findFileInput = () => document.querySelector('input[type="file"][accept*="image" i]') || document.querySelector('input[type="file"]');
+  const findFileInput = () => {
+    const selectors = [
+      'input[type="file"][accept*="image" i]',
+      'input[type="file"][accept*="png" i]',
+      'input[type="file"][accept*="jpg" i]',
+      'input[type="file"]'
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  };
 
   let input = findFileInput();
   if (!input) {
     // 尝试点击“添加附件/上传”按钮以触发文件输入出现
-    const attachBtn = document.querySelector('button[aria-label*="attach" i],button[aria-label*="upload" i],button[aria-label*="上传" i],button[aria-label*="添加附件" i],button[data-testid*="attach" i]');
-    if (attachBtn) {
-      attachBtn.click();
-      input = await waitFor(() => findFileInput(), 2500, 150);
+    const attachSelectors = [
+      'button[aria-label*="attach" i]',
+      'button[aria-label*="upload" i]',
+      'button[aria-label*="image" i]',
+      'button[aria-label*="photo" i]',
+      'button[aria-label*="上传" i]',
+      'button[aria-label*="添加附件" i]',
+      'button[aria-label*="图片" i]',
+      'button[data-testid*="attach" i]',
+    ];
+    if (normalized === 'google') {
+      attachSelectors.push(
+        'button[aria-label*="add image" i]',
+        'button[aria-label*="add file" i]',
+        'button[aria-label*="insert" i]',
+        'button[data-tooltip*="upload" i]'
+      );
+    }
+    for (const sel of attachSelectors) {
+      const attachBtn = document.querySelector(sel);
+      if (attachBtn) {
+        attachBtn.click();
+        input = await waitFor(() => findFileInput(), 2500, 150);
+        if (input) break;
+      }
     }
   }
   if (!input) throw new Error('未找到图片上传控件');
@@ -696,8 +826,15 @@ function injectSidebar() {
         <div class="sidebar-header">
           <h2>截图设置</h2>
           <div>
-            <button id="refresh-chatgpt-tabs-btn">刷新 ChatGPT 标签</button>
+            <button id="refresh-ai-tabs-btn">刷新 ChatGPT 标签</button>
             <button id="close-sidebar-btn">关闭</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>目标 AI 平台</label>
+          <div class="ai-platform-toggle">
+            <button class="ai-platform-btn active" data-platform="chatgpt">ChatGPT</button>
+            <button class="ai-platform-btn" data-platform="google">Google AI Studio</button>
           </div>
         </div>
         <div class="form-group">
@@ -724,8 +861,8 @@ function injectSidebar() {
           <button id="cfg-add-text" style="margin-top:8px">新增一条文本</button>
         </div>
         <div class="form-group">
-          <label>ChatGPT 标签页</label>
-          <select id="chatgpt-tabs-select"></select>
+          <label id="cfg-tabs-label">ChatGPT 标签页</label>
+          <select id="ai-tabs-select"></select>
         </div>
         <div class="form-group">
           <label><input type="checkbox" id="cfg-auto-send-after-upload" /> 图片上传完成后自动发送消息</label>
@@ -813,6 +950,25 @@ function injectSidebar() {
           }
           button:hover { background: #357abd; }
 
+          .ai-platform-toggle {
+            display: flex;
+            gap: 8px;
+          }
+          .ai-platform-btn {
+            flex: 1;
+            background: #f3f4f6;
+            color: #333;
+            border: 1px solid #d1d5db;
+          }
+          .ai-platform-btn:hover {
+            background: #e5e7eb;
+          }
+          .ai-platform-btn.active {
+            background: #2563eb;
+            border-color: #2563eb;
+            color: #fff;
+          }
+
           #close-sidebar-btn { background: #e2e2e2; color:#333; }
           #close-sidebar-btn:hover { background: #d1d1d1; }
 
@@ -840,8 +996,10 @@ function initializeSettingsPanel() {
   const quickHotkeyInput = sidebar.querySelector('#cfg-quick-hotkey');
   const textsContainer = sidebar.querySelector('#cfg-texts-container');
   const addTextBtn = sidebar.querySelector('#cfg-add-text');
-  const tabsSelect = sidebar.querySelector('#chatgpt-tabs-select');
-  const refreshTabsBtn = sidebar.querySelector('#refresh-chatgpt-tabs-btn');
+  const tabsSelect = sidebar.querySelector('#ai-tabs-select');
+  const refreshTabsBtn = sidebar.querySelector('#refresh-ai-tabs-btn');
+  const tabsLabel = sidebar.querySelector('#cfg-tabs-label');
+  const platformButtons = Array.from(sidebar.querySelectorAll('.ai-platform-btn'));
   const closeBtn = sidebar.querySelector('#close-sidebar-btn');
   const saveBtn = sidebar.querySelector('#cfg-save-settings');
   const autoSendCheckbox = sidebar.querySelector('#cfg-auto-send-after-upload');
@@ -885,22 +1043,33 @@ function initializeSettingsPanel() {
     return Array.from(inputs).map(i => i.value || '');
   }
 
-  function refreshChatGPTTabs(selectedId) {
+  const PLATFORM_UI = {
+    chatgpt: {
+      refreshLabel: '刷新 ChatGPT 标签',
+    },
+    google: {
+      refreshLabel: '刷新 Google 标签',
+    },
+  };
+
+  function refreshPlatformTabs(selectedId) {
+    const platform = normalizePlatform(draft?.targetPlatform);
+    const meta = getPlatformMeta(platform);
     tabsSelect.innerHTML = '';
     const autoOpt = document.createElement('option');
     autoOpt.value = '';
-    autoOpt.textContent = '自动选择（当前活动的 ChatGPT 标签）';
+    autoOpt.textContent = `自动选择（当前活动的 ${meta.label} 标签）`;
     tabsSelect.appendChild(autoOpt);
 
     if (!chrome?.runtime?.id) {
-      console.warn('扩展上下文不可用，无法刷新 ChatGPT 标签列表');
+      console.warn('扩展上下文不可用，无法刷新标签列表');
       return;
     }
 
     try {
-      chrome.runtime.sendMessage({ type: 'listChatGPTTabs' }, (resp) => {
+      chrome.runtime.sendMessage({ type: meta.listMessageType }, (resp) => {
         if (chrome.runtime.lastError) {
-          console.warn('listChatGPTTabs 调用失败：', chrome.runtime.lastError.message || chrome.runtime.lastError);
+          console.warn(`${meta.listMessageType} 调用失败：`, chrome.runtime.lastError.message || chrome.runtime.lastError);
           return;
         }
         const tabs = (resp && resp.success && Array.isArray(resp.tabs)) ? resp.tabs : [];
@@ -908,12 +1077,14 @@ function initializeSettingsPanel() {
         tabs.forEach(t => {
           const opt = document.createElement('option');
           opt.value = String(t.id);
-          opt.textContent = `${t.active ? '[活动] ' : ''}${t.title || t.url || 'ChatGPT'} (ID: ${t.id})`;
+          opt.textContent = `${t.active ? '[活动] ' : ''}${t.title || t.url || meta.label} (ID: ${t.id})`;
           tabsSelect.appendChild(opt);
           if (t.active) activeId = String(t.id);
         });
-        if (selectedId != null && selectedId !== undefined && selectedId !== '') {
-          tabsSelect.value = String(selectedId);
+        const preferred = (selectedId !== undefined && selectedId !== null) ? String(selectedId) : '';
+        const hasPreferred = preferred && Array.from(tabsSelect.options).some(opt => opt.value === preferred);
+        if (hasPreferred) {
+          tabsSelect.value = preferred;
         } else if (activeId) {
           tabsSelect.value = activeId;
         } else {
@@ -921,7 +1092,32 @@ function initializeSettingsPanel() {
         }
       });
     } catch (e) {
-      console.warn('刷新 ChatGPT 标签时出现异常：', e);
+      console.warn('刷新标签时出现异常：', e);
+    }
+  }
+
+  function setActivePlatform(platform, { forceRefresh = false } = {}) {
+    const normalized = normalizePlatform(platform);
+    const previous = normalizePlatform(draft?.targetPlatform);
+    if (draft) {
+      draft.targetPlatform = normalized;
+    }
+    settings.targetPlatform = normalized;
+    platformButtons.forEach((btn) => {
+      const btnPlatform = normalizePlatform(btn.dataset.platform);
+      btn.classList.toggle('active', btnPlatform === normalized);
+    });
+    if (tabsLabel) {
+      tabsLabel.textContent = `${getPlatformLabel(normalized)} 标签页`;
+    }
+    const uiCfg = PLATFORM_UI[normalized] || PLATFORM_UI.chatgpt;
+    if (refreshTabsBtn) {
+      refreshTabsBtn.textContent = uiCfg.refreshLabel;
+    }
+    if (forceRefresh || normalized !== previous) {
+      const storedId = getPlatformTabIdFrom(draft, normalized);
+      const selectedValue = storedId != null ? String(storedId) : '';
+      refreshPlatformTabs(selectedValue);
     }
   }
 
@@ -935,6 +1131,16 @@ function initializeSettingsPanel() {
     const next = collectTexts().concat('');
     draft.texts = next;
     renderTexts(draft.texts);
+  });
+
+  platformButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (!draft) return;
+      const btnPlatform = normalizePlatform(btn.dataset.platform);
+      const current = normalizePlatform(draft.targetPlatform);
+      const forceRefresh = btnPlatform === current;
+      setActivePlatform(btnPlatform, { forceRefresh });
+    });
   });
 
   autoSendCheckbox.addEventListener('change', () => {
@@ -1043,22 +1249,30 @@ function initializeSettingsPanel() {
   }, true);
 
   refreshTabsBtn.addEventListener('click', () => {
-    refreshChatGPTTabs(tabsSelect.value || '');
+    if (!draft) return;
+    refreshPlatformTabs(tabsSelect.value || '');
   });
 
   tabsSelect.addEventListener('change', () => {
+    if (!draft) return;
     const val = tabsSelect.value;
-    draft.targetChatGPTTabId = val ? Number(val) : null;
+    const normalized = normalizePlatform(draft.targetPlatform);
+    setPlatformTabIdFor(draft, normalized, val && val !== '' ? Number(val) : null);
+    setPlatformTabIdFor(settings, normalized, val && val !== '' ? Number(val) : null);
   });
 
 
   // 保存按钮：一次性保存草稿
   saveBtn.addEventListener('click', () => {
+    if (!draft) return;
     // 最终收集 UI 值，避免遗漏
     draft.texts = collectTexts();
     draft.selector = selectorInput.value;
     draft.screenshotArea = areaSel.value;
-    draft.targetChatGPTTabId = tabsSelect.value ? Number(tabsSelect.value) : null;
+    const normalized = normalizePlatform(draft.targetPlatform);
+    const selectedVal = tabsSelect.value;
+    setPlatformTabIdFor(draft, normalized, selectedVal && selectedVal !== '' ? Number(selectedVal) : null);
+    draft.targetPlatform = normalized;
     saveSettings(draft, () => {
       console.log('设置已保存');
     });
@@ -1067,13 +1281,21 @@ function initializeSettingsPanel() {
   // 初始化填充
   loadSettings((s) => {
     draft = JSON.parse(JSON.stringify(s));
+    draft.targetPlatform = normalizePlatform(draft.targetPlatform);
     areaSel.value = draft.screenshotArea || 'full';
     selectorInput.style.display = areaSel.value === 'selector' ? 'block' : 'none';
     selectorInput.value = draft.selector || '';
     hotkeyInput.value = formatHotkeyForDisplay((draft.hotkey || 'Ctrl+Shift+S').replace(/\s+/g, '').toLowerCase());
     quickHotkeyInput.value = formatHotkeyForDisplay((draft.quickHotkey || 'Ctrl+Shift+Q').replace(/\s+/g, '').toLowerCase());
     renderTexts(Array.isArray(draft.texts) ? draft.texts : ['']);
-    refreshChatGPTTabs(draft.targetChatGPTTabId != null ? String(draft.targetChatGPTTabId) : '');
+    autoSendCheckbox.checked = !!draft.autoSendAfterUpload;
+    ibbotUrlInput.value = draft.ibbotUrl || '';
+    ibbotTokenInput.value = draft.ibbotToken || '';
+    replyTimeoutInput.value = draft.replyWaitTimeoutMs != null ? draft.replyWaitTimeoutMs : '';
+    replyStableCyclesInput.value = draft.replyStableCycles != null ? draft.replyStableCycles : '';
+    replyPollIntervalInput.value = draft.replyPollIntervalMs != null ? draft.replyPollIntervalMs : '';
+    sendBtnTimeoutInput.value = draft.sendButtonWaitTimeoutMs != null ? draft.sendButtonWaitTimeoutMs : '';
+    setActivePlatform(draft.targetPlatform, { forceRefresh: true });
   });
 }
 
@@ -1125,13 +1347,27 @@ function sendMessageSafe(payload, retries = 3, delay = 600) {
 
 // 新增：等待发送按钮可用、点击发送、等待助手回复完成、发送提示词并等待
 function getSendButtonElement() {
+  const platform = normalizePlatform(activeComposePlatform);
   const selectors = [
     'button[data-testid="send-button"]',
+    'button[data-testid*="send" i]',
     'button[aria-label*="send" i]',
     'button[aria-label*="发送" i]',
     'form button[type="submit"]'
   ];
+  if (platform === 'google') {
+    selectors.push(
+      'button[aria-label*="submit" i]',
+      'button[aria-label*="回复" i]',
+      'button[aria-label*="回答" i]',
+      'button[aria-label*="create" i]',
+      'button[aria-label*="start" i]'
+    );
+  }
+  const seen = new Set();
   for (const sel of selectors) {
+    if (seen.has(sel)) continue;
+    seen.add(sel);
     const btn = document.querySelector(sel);
     if (btn && isVisible(btn)) return btn;
   }
@@ -1156,7 +1392,25 @@ async function clickSendButtonWhenEnabled(timeout = 60000) {
 }
 
 function getLastAssistantMessageEl() {
-  const candidates = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], div[data-testid="conversation-turn"]'));
+  const selectors = [
+    '[data-message-author-role="assistant"]',
+    'div[data-testid="conversation-turn"]',
+    'div[data-testid*="response" i]',
+    'article[data-testid*="response" i]',
+    'div[aria-live="polite"] article',
+    'section[aria-live] article'
+  ];
+  const collected = [];
+  const seen = new Set();
+  selectors.forEach((sel) => {
+    document.querySelectorAll(sel).forEach((node) => {
+      if (!seen.has(node)) {
+        seen.add(node);
+        collected.push(node);
+      }
+    });
+  });
+  const candidates = collected;
   const last = candidates.length ? candidates[candidates.length - 1] : null;
   return last || null;
 }
@@ -1165,7 +1419,7 @@ function getLastAssistantText() {
   const el = getLastAssistantMessageEl();
   if (!el) return '';
   // 常见内容容器
-  const textEl = el.querySelector('.markdown, [data-message-author-role="assistant"], .prose, article, div');
+  const textEl = el.querySelector('.markdown, [data-message-author-role="assistant"], .prose, article, div, [data-testid*="response" i]');
   return (textEl ? textEl.innerText : el.innerText) || '';
 }
 
