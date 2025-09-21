@@ -230,6 +230,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
         if (request.imageDataUrl) {
           await attachImageToAssistant(request.imageDataUrl, 'google');
+          await dismissGoogleImagePreview(settings?.googlePreviewDismissTimeoutMs || 6000, 'google');
           await waitForSendButtonEnabled(settings.sendButtonWaitTimeoutMs || 60000);
         }
         if (typeof request.text === 'string') {
@@ -674,7 +675,143 @@ async function attachImageToAssistant(dataUrl, platform = 'chatgpt') {
   input.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+async function dismissGoogleImagePreview(timeout = 6000, platform = normalizePlatform(activeComposePlatform)) {
+  if (normalizePlatform(platform) !== 'google') return false;
+
+  const previewKeywords = ['preview', 'image', 'photo', 'attachment', 'media', '图片', '照片', '预览', '截图'];
+  const buttonTextKeywords = ['done', 'close', 'insert', 'ok', 'remove', 'finish', 'cancel', 'apply', '确定', '完成', '关闭', '插入', '取消'];
+  const dialogSelectors = [
+    'div[role="dialog"]',
+    'c-wiz[role="dialog"]',
+    'div[aria-modal="true"]',
+    'div[data-dialog-id]'
+  ];
+
+  const end = Date.now() + timeout;
+  let dismissed = false;
+  let escapeDispatched = false;
+
+  const collectDialogs = () => {
+    const seen = new Set();
+    const dialogs = [];
+    dialogSelectors.forEach((sel) => {
+      document.querySelectorAll(sel).forEach((node) => {
+        if (!node || seen.has(node) || !isVisible(node)) return;
+        seen.add(node);
+        if (isLikelyPreviewDialog(node)) {
+          dialogs.push(node);
+        }
+      });
+    });
+    return dialogs;
+  };
+
+  function isLikelyPreviewDialog(node) {
+    if (!node || !isVisible(node)) return false;
+    if (node.querySelector('img, canvas, video, picture')) return true;
+    const aria = (node.getAttribute('aria-label') || '').toLowerCase();
+    if (previewKeywords.some((k) => aria.includes(k))) return true;
+    const text = ((node.textContent || '').slice(0, 2000)).toLowerCase();
+    if (previewKeywords.some((k) => text.includes(k))) return true;
+    return false;
+  }
+
+  function findDismissButton(container) {
+    const selectors = [
+      'button[aria-label*="close" i]',
+      'button[aria-label*="dismiss" i]',
+      'button[aria-label*="cancel" i]',
+      'button[aria-label*="done" i]',
+      'button[aria-label*="insert" i]',
+      'button[aria-label*="finish" i]',
+      'button[aria-label*="remove" i]',
+      'button[aria-label*="关闭" i]',
+      'button[aria-label*="完成" i]',
+      'button[aria-label*="确定" i]',
+      'button[aria-label*="取消" i]',
+      'button[data-testid*="close" i]',
+      'button[data-testid*="dismiss" i]',
+      'button[data-testid*="cancel" i]',
+      'button[data-testid*="done" i]',
+      'button[data-mdc-dialog-action]',
+      'div[role="button"][aria-label*="close" i]',
+      'div[role="button"][aria-label*="dismiss" i]',
+      'div[role="button"][aria-label*="cancel" i]'
+    ];
+    const seen = new Set();
+    const candidates = [];
+    selectors.forEach((sel) => {
+      container.querySelectorAll(sel).forEach((btn) => {
+        if (seen.has(btn) || !isVisible(btn)) return;
+        seen.add(btn);
+        candidates.push(btn);
+      });
+    });
+    container.querySelectorAll('button, div[role="button"]').forEach((btn) => {
+      if (seen.has(btn) || !isVisible(btn)) return;
+      const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+      if (!text) return;
+      if (buttonTextKeywords.some((k) => text.includes(k))) {
+        seen.add(btn);
+        candidates.push(btn);
+      }
+    });
+    return candidates[0] || null;
+  }
+
+  while (Date.now() < end) {
+    const dialogs = collectDialogs();
+    if (!dialogs.length) {
+      if (dismissed) return true;
+      await new Promise((r) => setTimeout(r, 120));
+      continue;
+    }
+
+    let clicked = false;
+    for (const dialog of dialogs) {
+      const btn = findDismissButton(dialog);
+      if (btn) {
+        btn.click();
+        dismissed = true;
+        clicked = true;
+        break;
+      }
+    }
+
+    if (!clicked && !escapeDispatched) {
+      const down = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true });
+      const up = new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true });
+      document.dispatchEvent(down);
+      document.dispatchEvent(up);
+      escapeDispatched = true;
+    }
+
+    await new Promise((r) => setTimeout(r, 160));
+
+    if (!collectDialogs().length) {
+      return dismissed;
+    }
+  }
+
+  return dismissed;
+}
+
 async function fillTextAndSend(text) {
+  const platform = normalizePlatform(activeComposePlatform);
+  const want = String(text || '');
+  const targetFingerprint = normalizeForCompare(want);
+  const maxAttempts = platform === 'google' ? 4 : 2;
+  let attempt = 0;
+  let lastError = null;
+
+  if (platform === 'google') {
+    await dismissGoogleImagePreview(settings?.googlePreviewDismissTimeoutMs || 6000, platform);
+  }
+
+  function normalizeForCompare(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
   function findTargetsAll() {
     const textareas = Array.from(document.querySelectorAll('textarea[data-testid="prompt-textarea"], form textarea'));
     const editables = Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"], div[contenteditable="true"][data-lexical-editor], [contenteditable="true"]'));
@@ -683,96 +820,147 @@ async function fillTextAndSend(text) {
     return { textarea: visTextarea, editable: visEditable };
   }
 
-  // 等待输入区域可用
-  let { textarea, editable } = findTargetsAll();
-  if (!textarea && !editable) {
-    const res = await waitFor(() => {
-      const t = findTargetsAll();
-      return (t.textarea || t.editable) ? t : null;
-    }, 6000, 150);
-    if (res) { textarea = res.textarea; editable = res.editable; }
-  }
-  if (!textarea && !editable) {
-    throw new Error('未找到对话输入框');
+  function matchesCurrentComposerValue() {
+    const { textarea, editable } = findTargetsAll();
+    if (textarea) {
+      const val = normalizeForCompare(textarea.value);
+      if (val === targetFingerprint) return true;
+    }
+    if (editable) {
+      const content = normalizeForCompare(editable.innerText || editable.textContent || '');
+      if (content === targetFingerprint) return true;
+    }
+    return false;
   }
 
-  // 文本插入逻辑（带校验与多策略）
-  const want = String(text || '');
-  let ok = false;
+  async function ensureTextSticks() {
+    const timeoutMs = 4000;
+    const stableMs = 600;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (matchesCurrentComposerValue()) {
+        const stableUntil = Date.now() + stableMs;
+        let stable = true;
+        while (Date.now() < stableUntil) {
+          await new Promise(r => setTimeout(r, 120));
+          if (!matchesCurrentComposerValue()) {
+            stable = false;
+            break;
+          }
+        }
+        if (stable) return true;
+      }
+      await new Promise(r => setTimeout(r, 180));
+    }
+    return false;
+  }
 
-  if (textarea) {
-    textarea.focus();
-    try {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-      if (setter) setter.call(textarea, want); else textarea.value = want;
-      textarea.dispatchEvent(new Event('input', { bubbles: true }));
-      ok = (textarea.value || '') === want;
+  while (attempt < maxAttempts) {
+    attempt++;
+    let { textarea, editable } = findTargetsAll();
+    if (!textarea && !editable) {
+      const res = await waitFor(() => {
+        const t = findTargetsAll();
+        return (t.textarea || t.editable) ? t : null;
+      }, 6000, 150);
+      if (res) { textarea = res.textarea; editable = res.editable; }
+    }
+
+    if (!textarea && !editable) {
+      lastError = new Error('未找到对话输入框');
+      await new Promise(r => setTimeout(r, 150));
+      continue;
+    }
+
+    let ok = false;
+    let usedTextarea = false;
+
+    if (textarea) {
+      textarea.focus();
+      try {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+        if (setter) setter.call(textarea, want); else textarea.value = want;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        ok = (textarea.value || '') === want;
+        if (!ok) {
+          try {
+            textarea.value = '';
+            textarea.setRangeText(want);
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+            ok = (textarea.value || '') === want;
+          } catch {}
+        }
+        if (ok) usedTextarea = true;
+      } catch {}
+    }
+
+    if (!ok && editable) {
+      editable.focus();
+      try {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editable);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand('insertText', false, want);
+        editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        ok = normalizeForCompare(editable.innerText || '') === targetFingerprint || (editable.innerText || '').includes(want);
+      } catch {}
+
       if (!ok) {
-        // 退化方案：使用 setRangeText
         try {
-          textarea.value = '';
-          textarea.setRangeText(want);
-          textarea.dispatchEvent(new Event('input', { bubbles: true }));
-          ok = (textarea.value || '') === want;
+          const ev = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: want });
+          editable.dispatchEvent(ev);
+          editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+          ok = normalizeForCompare(editable.innerText || '') === targetFingerprint || (editable.innerText || '').includes(want);
         } catch {}
       }
-    } catch {}
-  }
 
-  if (!ok && editable) {
-    editable.focus();
+      if (!ok) {
+        try {
+          editable.innerHTML = '';
+          editable.appendChild(document.createTextNode(want));
+          editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+          ok = normalizeForCompare(editable.innerText || '') === targetFingerprint || (editable.innerText || '').includes(want);
+        } catch {}
+      }
+    }
+
+    if (!ok) {
+      lastError = new Error('写入文本失败');
+      await new Promise(r => setTimeout(r, 200));
+      continue;
+    }
+
+    await new Promise(r => setTimeout(r, 250));
+
+    if (platform === 'google') {
+      const persisted = await ensureTextSticks();
+      if (!persisted) {
+        lastError = new Error('Google 输入框暂未接受文本，重试写入');
+        await new Promise(r => setTimeout(r, 250));
+        continue;
+      }
+    }
+
+    const { textarea: latestTextarea, editable: latestEditable } = findTargetsAll();
+    const focusTarget = usedTextarea ? (latestTextarea || textarea) : (latestEditable || latestTextarea || editable || textarea);
+
+    console.debug('[chrome-screenshots] text filled');
     try {
-      // 优先用 selection + execCommand 插入
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(editable);
-      range.collapse(false);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      document.execCommand('insertText', false, want);
-      editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
-      ok = (editable.innerText || '').includes(want);
+      focusTarget?.focus();
+      if (usedTextarea && focusTarget && focusTarget instanceof HTMLTextAreaElement) {
+        const len = (focusTarget.value || '').length;
+        focusTarget.selectionStart = focusTarget.selectionEnd = len;
+      }
     } catch {}
-
-    if (!ok) {
-      try {
-        // 尝试 beforeinput
-        const ev = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: want });
-        editable.dispatchEvent(ev);
-        editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
-        ok = (editable.innerText || '').includes(want);
-      } catch {}
-    }
-
-    if (!ok) {
-      try {
-        editable.innerHTML = '';
-        editable.appendChild(document.createTextNode(want));
-        editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
-        ok = (editable.innerText || '').includes(want);
-      } catch {}
-    }
+    return;
   }
 
-  if (!ok) {
-    throw new Error('写入文本失败');
-  }
-
-  // 等待 UI 处理输入
-  await new Promise(r => setTimeout(r, 250));
-
-  // 取消任何自动发送逻辑，仅填入文本
-  const target = textarea || editable;
-  console.debug('[chrome-screenshots] text filled');
-  try {
-    target?.focus();
-    if (textarea) {
-      const len = (textarea.value || '').length;
-      textarea.selectionStart = textarea.selectionEnd = len;
-    }
-  } catch {}
-  return;
+  throw lastError || new Error('写入文本失败');
 }
+
 
 function showTextSelectionModal(texts) {
   return new Promise((resolve) => {
